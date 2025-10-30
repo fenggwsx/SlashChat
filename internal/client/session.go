@@ -18,11 +18,15 @@ type Session struct {
 	encoder  *protocol.Encoder
 	decoder  *protocol.Decoder
 	cancelFn context.CancelFunc
+	incoming chan protocol.Envelope
 }
 
 // NewSession initializes a session with configuration.
 func NewSession(cfg config.ClientConfig) *Session {
-	return &Session{cfg: cfg}
+	return &Session{
+		cfg:      cfg,
+		incoming: make(chan protocol.Envelope, 32),
+	}
 }
 
 // Connect dials the server and prepares framed JSON encoders/decoders.
@@ -65,13 +69,23 @@ func (s *Session) Send(ctx context.Context, env protocol.Envelope) error {
 }
 
 func (s *Session) readLoop(ctx context.Context) {
+	defer close(s.incoming)
 	for {
 		if ctx.Err() != nil {
 			return
 		}
-		_, err := s.decoder.Decode(ctx)
+		env, err := s.decoder.Decode(ctx)
 		if err != nil {
 			return
 		}
+		select {
+		case s.incoming <- env:
+		default:
+		}
 	}
+}
+
+// Messages returns a read-only channel for inbound envelopes.
+func (s *Session) Messages() <-chan protocol.Envelope {
+	return s.incoming
 }
