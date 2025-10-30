@@ -1,8 +1,10 @@
 package client
 
 import (
+	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -17,6 +19,7 @@ type App struct {
 	input     string
 	messages  []string
 	completed []string
+	session   *Session
 }
 
 // Mode represents the current interaction mode.
@@ -48,6 +51,8 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch m := msg.(type) {
 	case tea.KeyMsg:
 		return a.handleKey(m)
+	case connectResultMsg:
+		return a.handleConnectResult(m)
 	}
 	return a, nil
 }
@@ -104,15 +109,92 @@ func (a *App) handleEnter() (tea.Model, tea.Cmd) {
 		return a, nil
 	}
 
-	cmd := strings.TrimSpace(a.command)
-	if cmd == "" {
+	raw := strings.TrimSpace(a.command)
+	a.command = ""
+	if raw == "" {
 		return a, nil
 	}
 
-	a.messages = append(a.messages, fmt.Sprintf("executing %s", cmd))
-	a.completed = append(a.completed, cmd)
-	a.command = ""
+	a.completed = append(a.completed, raw)
+	return a, a.executeCommand(raw)
+}
+
+func (a *App) executeCommand(raw string) tea.Cmd {
+	a.pushMessage("> %s", raw)
+
+	prefix := string(a.cfg.CommandPrefix)
+	if !strings.HasPrefix(raw, prefix) {
+		a.pushMessage("commands must start with %s", prefix)
+		return nil
+	}
+
+	content := strings.TrimSpace(raw[len(prefix):])
+	if content == "" {
+		a.pushMessage("missing command name")
+		return nil
+	}
+
+	parts := strings.Fields(content)
+	name := strings.ToLower(parts[0])
+	args := parts[1:]
+
+	switch name {
+	case "connect":
+		return a.commandConnect(args)
+	case "quit", "exit":
+		return a.commandQuit()
+	default:
+		a.pushMessage("unknown command: %s", name)
+		return nil
+	}
+}
+
+func (a *App) commandConnect(args []string) tea.Cmd {
+	if a.session != nil {
+		a.pushMessage("already connected")
+		return nil
+	}
+
+	address := a.cfg.ServerAddr
+	if len(args) > 0 {
+		address = args[0]
+	}
+	if address == "" {
+		a.pushMessage("no server address configured")
+		return nil
+	}
+
+	a.pushMessage("connecting to %s ...", address)
+	a.cfg.ServerAddr = address
+	return connectCommand(a.cfg, address)
+}
+
+func (a *App) commandQuit() tea.Cmd {
+	a.pushMessage("closing client")
+	if a.session != nil {
+		_ = a.session.Close()
+		a.session = nil
+	}
+	return tea.Quit
+}
+
+func (a *App) handleConnectResult(msg connectResultMsg) (tea.Model, tea.Cmd) {
+	if msg.Err != nil {
+		a.pushMessage("connection failed: %v", msg.Err)
+		return a, nil
+	}
+
+	if a.session != nil {
+		_ = a.session.Close()
+	}
+
+	a.session = msg.Session
+	a.pushMessage("connected to %s", msg.Address)
 	return a, nil
+}
+
+func (a *App) pushMessage(format string, args ...interface{}) {
+	a.messages = append(a.messages, fmt.Sprintf(format, args...))
 }
 
 // View renders the terminal UI.
@@ -149,4 +231,30 @@ func titleBar(mode Mode) string {
 
 func separator() string {
 	return strings.Repeat("-", 40)
+}
+
+type connectResultMsg struct {
+	Address string
+	Session *Session
+	Err     error
+}
+
+const connectTimeout = 5 * time.Second
+
+func connectCommand(cfg config.ClientConfig, address string) tea.Cmd {
+	return func() tea.Msg {
+		sessionCfg := cfg
+		sessionCfg.ServerAddr = address
+		session := NewSession(sessionCfg)
+
+		ctx, cancel := context.WithTimeout(context.Background(), connectTimeout)
+		defer cancel()
+
+		if err := session.Connect(ctx); err != nil {
+			_ = session.Close()
+			return connectResultMsg{Address: address, Err: err}
+		}
+
+		return connectResultMsg{Address: address, Session: session}
+	}
 }

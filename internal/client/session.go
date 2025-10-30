@@ -38,9 +38,9 @@ func (s *Session) Connect(ctx context.Context) error {
 	s.conn = conn
 	s.encoder = protocol.NewEncoder(conn)
 	s.decoder = protocol.NewDecoder(conn)
-	ctx, cancel := context.WithCancel(ctx)
+	loopCtx, cancel := context.WithCancel(context.Background())
 	s.cancelFn = cancel
-	go s.readLoop(ctx)
+	go s.readLoop(loopCtx)
 	return nil
 }
 
