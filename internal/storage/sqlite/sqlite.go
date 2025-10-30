@@ -67,6 +67,9 @@ func (s *Store) CreateUser(ctx context.Context, user *storage.User) error {
 func (s *Store) GetUserByUsername(ctx context.Context, username string) (*storage.User, error) {
 	var model userModel
 	if err := s.db.WithContext(ctx).Where("username = ?", username).First(&model).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, storage.ErrNotFound
+		}
 		return nil, err
 	}
 	user := &storage.User{

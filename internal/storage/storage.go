@@ -2,8 +2,12 @@ package storage
 
 import (
 	"context"
+	"errors"
 	"time"
 )
+
+// ErrNotFound indicates that the requested record could not be located.
+var ErrNotFound = errors.New("storage: not found")
 
 // User represents a persisted account record.
 type User struct {
