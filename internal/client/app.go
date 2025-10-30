@@ -25,6 +25,7 @@ type App struct {
 	token       string
 	userID      string
 	pendingUser string
+	hints       []string
 }
 
 // Mode represents the current interaction mode.
@@ -73,6 +74,7 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case tea.KeyEsc:
 		a.mode = ModeCommand
 		a.command = ""
+		a.updateHints()
 	case tea.KeyEnter:
 		return a.handleEnter()
 	case tea.KeyBackspace:
@@ -88,11 +90,17 @@ func (a *App) captureInput(value string) {
 		return
 	}
 	if a.mode == ModeCommand {
-		if len(a.command) == 0 && value == string(a.cfg.CommandPrefix) {
+		prefix := string(a.cfg.CommandPrefix)
+		if len(a.command) == 0 {
+			if value != prefix {
+				return
+			}
 			a.command = value
+			a.updateHints()
 			return
 		}
 		a.command += value
+		a.updateHints()
 		return
 	}
 	a.input += value
@@ -103,6 +111,7 @@ func (a *App) backspace() {
 		if len(a.command) > 0 {
 			a.command = a.command[:len(a.command)-1]
 		}
+		a.updateHints()
 		return
 	}
 	if len(a.input) > 0 {
@@ -123,10 +132,12 @@ func (a *App) handleEnter() (tea.Model, tea.Cmd) {
 	raw := strings.TrimSpace(a.command)
 	a.command = ""
 	if raw == "" {
+		a.updateHints()
 		return a, nil
 	}
 
 	a.completed = append(a.completed, raw)
+	a.updateHints()
 	return a, a.executeCommand(raw)
 }
 
@@ -216,6 +227,36 @@ func (a *App) commandLogin(args []string) tea.Cmd {
 	return tea.Batch(
 		a.sendAuthRequest("login", username, password),
 	)
+}
+
+func (a *App) updateHints() {
+	if a.mode != ModeCommand {
+		a.hints = nil
+		return
+	}
+	prefix := string(a.cfg.CommandPrefix)
+	if !strings.HasPrefix(a.command, prefix) {
+		a.hints = nil
+		return
+	}
+	typed := strings.TrimSpace(strings.TrimPrefix(a.command, prefix))
+	var search string
+	if typed != "" {
+		parts := strings.Fields(typed)
+		if len(parts) > 0 {
+			search = strings.ToLower(parts[0])
+		}
+	}
+	suggestions := make([]string, 0, maxCommandHints)
+	for _, spec := range commandCatalog {
+		if search == "" || strings.HasPrefix(spec.Name, search) {
+			suggestions = append(suggestions, fmt.Sprintf("%s — %s", spec.Usage, spec.Description))
+			if len(suggestions) >= maxCommandHints {
+				break
+			}
+		}
+	}
+	a.hints = suggestions
 }
 
 func (a *App) ensureConnected() bool {
@@ -354,37 +395,89 @@ func (a *App) pushMessage(format string, args ...interface{}) {
 // View renders the terminal UI.
 func (a *App) View() string {
 	var b strings.Builder
-	b.WriteString(titleBar(a.mode))
+	b.WriteString(a.renderStatusBar())
+	b.WriteString("\n")
+	b.WriteString(separator())
 	b.WriteString("\n")
 	for _, msg := range a.messages {
 		b.WriteString(msg)
 		b.WriteString("\n")
 	}
+	if hints := a.renderCommandHints(); hints != "" {
+		b.WriteString(separator())
+		b.WriteString("\n")
+		b.WriteString(hints)
+		b.WriteString("\n")
+	}
 	b.WriteString(separator())
 	b.WriteString("\n")
-	if a.mode == ModeCommand {
-		b.WriteString(fmt.Sprintf("[%c] %s", a.cfg.CommandPrefix, a.command))
-	} else {
-		b.WriteString(a.input)
-	}
+	b.WriteString(a.renderInputLine())
 	return b.String()
 }
 
-func titleBar(mode Mode) string {
-	var label string
-	switch mode {
-	case ModeCommand:
-		label = "COMMAND"
-	case ModeInsert:
-		label = "INSERT"
-	default:
-		label = "UNKNOWN"
-	}
-	return fmt.Sprintf("GoSlash :: %s mode", label)
+func separator() string {
+	return strings.Repeat("-", 60)
 }
 
-func separator() string {
-	return strings.Repeat("-", 40)
+func (a *App) renderStatusBar() string {
+	mode := modeLabel(a.mode)
+	status := "offline"
+	server := "-"
+	if a.session != nil {
+		status = "connected"
+		if addr := a.session.cfg.ServerAddr; addr != "" {
+			server = addr
+		}
+	} else if a.cfg.ServerAddr != "" {
+		server = a.cfg.ServerAddr
+	}
+	user := "-"
+	switch {
+	case a.pendingUser != "":
+		user = a.pendingUser + "*"
+	case a.token != "":
+		if a.userID != "" {
+			user = a.userID
+		} else {
+			user = "authenticated"
+		}
+	}
+	room := "-"
+	return fmt.Sprintf("GoSlash | Mode:%s | Status:%s | Server:%s | User:%s | Room:%s", mode, status, server, user, room)
+}
+
+func (a *App) renderCommandHints() string {
+	if a.mode != ModeCommand || len(a.hints) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("Commands:\n")
+	for _, hint := range a.hints {
+		b.WriteString("  ")
+		b.WriteString(hint)
+		b.WriteString("\n")
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+func (a *App) renderInputLine() string {
+	if a.mode == ModeCommand {
+		prefix := string(a.cfg.CommandPrefix)
+		typed := strings.TrimPrefix(a.command, prefix)
+		return fmt.Sprintf("[%c] %s", a.cfg.CommandPrefix, typed)
+	}
+	return a.input
+}
+
+func modeLabel(mode Mode) string {
+	switch mode {
+	case ModeCommand:
+		return "COMMAND"
+	case ModeInsert:
+		return "INSERT"
+	default:
+		return "UNKNOWN"
+	}
 }
 
 type connectResultMsg struct {
@@ -410,12 +503,39 @@ type authSendResultMsg struct {
 const (
 	connectTimeout     = 5 * time.Second
 	authRequestTimeout = 5 * time.Second
+	maxCommandHints    = 5
 )
 
-const (
-	ackStatusOK    = "ok"
-	ackStatusError = "error"
-)
+const ackStatusError = "error"
+
+type commandSpec struct {
+	Name        string
+	Usage       string
+	Description string
+}
+
+var commandCatalog = []commandSpec{
+	{
+		Name:        "connect",
+		Usage:       "/connect [address]",
+		Description: "Connect to a GoSlash server",
+	},
+	{
+		Name:        "register",
+		Usage:       "/register <username> <password>",
+		Description: "Create a new account on the server",
+	},
+	{
+		Name:        "login",
+		Usage:       "/login <username> <password>",
+		Description: "Authenticate with an existing account",
+	},
+	{
+		Name:        "quit",
+		Usage:       "/quit",
+		Description: "Exit the GoSlash client (alias: /exit)",
+	},
+}
 
 func connectCommand(cfg config.ClientConfig, address string) tea.Cmd {
 	return func() tea.Msg {
