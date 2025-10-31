@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/fenggwsx/SlashChat/internal/config"
@@ -25,7 +26,10 @@ type App struct {
 	token       string
 	userID      string
 	pendingUser string
+	username    string
 	hints       []string
+	viewport    viewport.Model
+	logLine     string
 }
 
 // Mode represents the current interaction mode.
@@ -40,11 +44,15 @@ const (
 
 // NewApp returns a Bubble Tea model pre-populated with defaults.
 func NewApp(cfg config.ClientConfig) tea.Model {
-	return &App{
+	vp := viewport.New(0, 0)
+	app := &App{
 		cfg:      cfg,
-		mode:     ModeCommand,
+		mode:     ModeInsert,
 		messages: make([]string, 0, 128),
+		viewport: vp,
 	}
+	app.refreshViewport()
+	return app
 }
 
 // Init is part of the tea.Model interface.
@@ -55,6 +63,9 @@ func (a *App) Init() tea.Cmd {
 // Update handles user input and internal events.
 func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch m := msg.(type) {
+	case tea.WindowSizeMsg:
+		a.resizeViewport(m.Width, m.Height)
+		return a, nil
 	case tea.KeyMsg:
 		return a.handleKey(m)
 	case connectResultMsg:
@@ -71,10 +82,22 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.Type {
+	case tea.KeyPgUp:
+		a.scrollMessages(a.viewport.Height)
+		return a, nil
+	case tea.KeyPgDown:
+		a.scrollMessages(-a.viewport.Height)
+		return a, nil
+	case tea.KeyUp:
+		a.scrollMessages(1)
+		return a, nil
+	case tea.KeyDown:
+		a.scrollMessages(-1)
+		return a, nil
 	case tea.KeyEsc:
-		a.mode = ModeCommand
+		a.mode = ModeInsert
 		a.command = ""
-		a.updateHints()
+		a.hints = nil
 	case tea.KeyEnter:
 		return a.handleEnter()
 	case tea.KeyBackspace:
@@ -103,6 +126,13 @@ func (a *App) captureInput(value string) {
 		a.updateHints()
 		return
 	}
+	prefix := string(a.cfg.CommandPrefix)
+	if len(a.input) == 0 && value == prefix {
+		a.mode = ModeCommand
+		a.command = prefix
+		a.updateHints()
+		return
+	}
 	a.input += value
 }
 
@@ -110,8 +140,16 @@ func (a *App) backspace() {
 	if a.mode == ModeCommand {
 		if len(a.command) > 0 {
 			a.command = a.command[:len(a.command)-1]
+			if len(a.command) == 0 {
+				a.mode = ModeInsert
+				a.hints = nil
+				return
+			}
+			a.updateHints()
+			return
 		}
-		a.updateHints()
+		a.mode = ModeInsert
+		a.hints = nil
 		return
 	}
 	if len(a.input) > 0 {
@@ -122,7 +160,7 @@ func (a *App) backspace() {
 func (a *App) handleEnter() (tea.Model, tea.Cmd) {
 	if a.mode == ModeInsert {
 		if trimmed := strings.TrimSpace(a.input); trimmed != "" {
-			a.messages = append(a.messages, trimmed)
+			a.addMessage(trimmed)
 			a.completed = append(a.completed, trimmed)
 		}
 		a.input = ""
@@ -132,27 +170,30 @@ func (a *App) handleEnter() (tea.Model, tea.Cmd) {
 	raw := strings.TrimSpace(a.command)
 	a.command = ""
 	if raw == "" {
-		a.updateHints()
+		a.mode = ModeInsert
+		a.hints = nil
 		return a, nil
 	}
 
 	a.completed = append(a.completed, raw)
-	a.updateHints()
-	return a, a.executeCommand(raw)
+	cmd := a.executeCommand(raw)
+	a.mode = ModeInsert
+	a.hints = nil
+	return a, cmd
 }
 
 func (a *App) executeCommand(raw string) tea.Cmd {
-	a.pushMessage("> %s", raw)
+	a.log("command: %s", raw)
 
 	prefix := string(a.cfg.CommandPrefix)
 	if !strings.HasPrefix(raw, prefix) {
-		a.pushMessage("commands must start with %s", prefix)
+		a.log("commands must start with %s", prefix)
 		return nil
 	}
 
 	content := strings.TrimSpace(raw[len(prefix):])
 	if content == "" {
-		a.pushMessage("missing command name")
+		a.log("missing command name")
 		return nil
 	}
 
@@ -170,14 +211,14 @@ func (a *App) executeCommand(raw string) tea.Cmd {
 	case "quit", "exit":
 		return a.commandQuit()
 	default:
-		a.pushMessage("unknown command: %s", name)
+		a.log("unknown command: %s", name)
 		return nil
 	}
 }
 
 func (a *App) commandConnect(args []string) tea.Cmd {
 	if a.session != nil {
-		a.pushMessage("already connected")
+		a.log("already connected")
 		return nil
 	}
 
@@ -186,11 +227,11 @@ func (a *App) commandConnect(args []string) tea.Cmd {
 		address = args[0]
 	}
 	if address == "" {
-		a.pushMessage("no server address configured")
+		a.log("no server address configured")
 		return nil
 	}
 
-	a.pushMessage("connecting to %s ...", address)
+	a.log("connecting to %s ...", address)
 	a.cfg.ServerAddr = address
 	return connectCommand(a.cfg, address)
 }
@@ -200,12 +241,12 @@ func (a *App) commandRegister(args []string) tea.Cmd {
 		return nil
 	}
 	if len(args) < 2 {
-		a.pushMessage("usage: /register <username> <password>")
+		a.log("usage: /register <username> <password>")
 		return nil
 	}
 	username := args[0]
 	password := args[1]
-	a.pushMessage("registering as %s...", username)
+	a.log("registering as %s...", username)
 	a.pendingUser = username
 	return tea.Batch(
 		a.sendAuthRequest("register", username, password),
@@ -217,12 +258,12 @@ func (a *App) commandLogin(args []string) tea.Cmd {
 		return nil
 	}
 	if len(args) < 2 {
-		a.pushMessage("usage: /login <username> <password>")
+		a.log("usage: /login <username> <password>")
 		return nil
 	}
 	username := args[0]
 	password := args[1]
-	a.pushMessage("logging in as %s...", username)
+	a.log("logging in as %s...", username)
 	a.pendingUser = username
 	return tea.Batch(
 		a.sendAuthRequest("login", username, password),
@@ -261,7 +302,7 @@ func (a *App) updateHints() {
 
 func (a *App) ensureConnected() bool {
 	if a.session == nil {
-		a.pushMessage("not connected; use /connect first")
+		a.log("not connected; use /connect first")
 		return false
 	}
 	return true
@@ -291,7 +332,7 @@ func (a *App) sendAuthRequest(action, username, password string) tea.Cmd {
 }
 
 func (a *App) commandQuit() tea.Cmd {
-	a.pushMessage("closing client")
+	a.log("closing client")
 	if a.session != nil {
 		_ = a.session.Close()
 		a.session = nil
@@ -299,12 +340,15 @@ func (a *App) commandQuit() tea.Cmd {
 	a.token = ""
 	a.userID = ""
 	a.pendingUser = ""
+	a.username = ""
+	a.mode = ModeInsert
+	a.hints = nil
 	return tea.Quit
 }
 
 func (a *App) handleConnectResult(msg connectResultMsg) (tea.Model, tea.Cmd) {
 	if msg.Err != nil {
-		a.pushMessage("connection failed: %v", msg.Err)
+		a.log("connection failed: %v", msg.Err)
 		return a, nil
 	}
 
@@ -313,10 +357,11 @@ func (a *App) handleConnectResult(msg connectResultMsg) (tea.Model, tea.Cmd) {
 	}
 
 	a.session = msg.Session
-	a.pushMessage("connected to %s", msg.Address)
+	a.log("connected to %s", msg.Address)
 	a.token = ""
 	a.userID = ""
 	a.pendingUser = ""
+	a.username = ""
 	return a, listenForMessages(a.session)
 }
 
@@ -325,7 +370,7 @@ func (a *App) handleEnvelope(msg envelopeMsg) (tea.Model, tea.Cmd) {
 		return a, nil
 	}
 	if err := a.processEnvelope(msg.Envelope); err != nil {
-		a.pushMessage("message error: %v", err)
+		a.log("message error: %v", err)
 	}
 	return a, listenForMessages(a.session)
 }
@@ -338,13 +383,14 @@ func (a *App) handleSessionClosed(msg sessionClosedMsg) (tea.Model, tea.Cmd) {
 	a.token = ""
 	a.userID = ""
 	a.pendingUser = ""
-	a.pushMessage("connection closed")
+	a.username = ""
+	a.log("connection closed")
 	return a, nil
 }
 
 func (a *App) handleAuthResult(msg authSendResultMsg) (tea.Model, tea.Cmd) {
 	if msg.Err != nil {
-		a.pushMessage("auth request failed: %v", msg.Err)
+		a.log("auth request failed: %v", msg.Err)
 		if a.pendingUser == msg.Username {
 			a.pendingUser = ""
 		}
@@ -361,9 +407,9 @@ func (a *App) processEnvelope(env protocol.Envelope) error {
 		}
 		status := strings.ToLower(ack.Status)
 		if ack.Reason != "" {
-			a.pushMessage("ack[%s]: %s", status, ack.Reason)
+			a.log("ack[%s]: %s", status, ack.Reason)
 		} else {
-			a.pushMessage("ack[%s]", status)
+			a.log("ack[%s]", status)
 		}
 		if status == ackStatusError {
 			a.pendingUser = ""
@@ -377,41 +423,82 @@ func (a *App) processEnvelope(env protocol.Envelope) error {
 		a.userID = resp.UserID
 		username := a.pendingUser
 		if username == "" {
-			username = resp.UserID
+			username = a.username
 		}
 		expires := time.Unix(resp.ExpiresAt, 0).Format(time.RFC3339)
-		a.pushMessage("authenticated as %s (user id: %s, expires: %s)", username, resp.UserID, expires)
+		a.log("authenticated as %s (user id: %s, expires: %s)", username, resp.UserID, expires)
 		a.pendingUser = ""
+		if username != "" {
+			a.username = username
+		}
 	default:
-		a.pushMessage("received envelope type %s", env.Type)
+		a.log("received envelope type %s", env.Type)
 	}
 	return nil
 }
 
-func (a *App) pushMessage(format string, args ...interface{}) {
-	a.messages = append(a.messages, fmt.Sprintf(format, args...))
+func (a *App) log(format string, args ...interface{}) {
+	a.logLine = fmt.Sprintf(format, args...)
+}
+
+func (a *App) addMessage(message string) {
+	a.messages = append(a.messages, message)
+	a.refreshViewport()
+}
+
+func (a *App) refreshViewport() {
+	content := strings.Join(a.messages, "\n")
+	atBottom := a.viewport.AtBottom()
+	a.viewport.SetContent(content)
+	if atBottom {
+		a.viewport.GotoBottom()
+	}
+}
+
+func (a *App) scrollMessages(lines int) {
+	if lines > 0 {
+		a.viewport.LineUp(lines)
+	} else if lines < 0 {
+		a.viewport.LineDown(-lines)
+	}
+}
+
+func (a *App) resizeViewport(width, height int) {
+	if width <= 0 || height <= 0 {
+		return
+	}
+	const reservedLines = 7
+	viewportHeight := height - reservedLines
+	if viewportHeight < 3 {
+		viewportHeight = 3
+	}
+	a.viewport.Width = width
+	a.viewport.Height = viewportHeight
+	a.refreshViewport()
 }
 
 // View renders the terminal UI.
 func (a *App) View() string {
 	var b strings.Builder
-	b.WriteString(a.renderStatusBar())
+	b.WriteString(a.viewport.View())
 	b.WriteString("\n")
-	b.WriteString(separator())
-	b.WriteString("\n")
-	for _, msg := range a.messages {
-		b.WriteString(msg)
-		b.WriteString("\n")
-	}
-	if hints := a.renderCommandHints(); hints != "" {
-		b.WriteString(separator())
-		b.WriteString("\n")
-		b.WriteString(hints)
-		b.WriteString("\n")
-	}
 	b.WriteString(separator())
 	b.WriteString("\n")
 	b.WriteString(a.renderInputLine())
+	b.WriteString("\n")
+	if hintLines := a.renderCommandHints(); len(hintLines) > 0 {
+		for _, line := range hintLines {
+			b.WriteString(line)
+			b.WriteString("\n")
+		}
+	}
+	if a.logLine != "" {
+		b.WriteString(a.logLine)
+		b.WriteString("\n")
+	}
+	b.WriteString(separator())
+	b.WriteString("\n")
+	b.WriteString(a.renderStatusBar())
 	return b.String()
 }
 
@@ -435,38 +522,34 @@ func (a *App) renderStatusBar() string {
 	switch {
 	case a.pendingUser != "":
 		user = a.pendingUser + "*"
+	case a.username != "":
+		user = a.username
 	case a.token != "":
-		if a.userID != "" {
-			user = a.userID
-		} else {
-			user = "authenticated"
-		}
+		user = "authenticated"
 	}
 	room := "-"
 	return fmt.Sprintf("GoSlash | Mode:%s | Status:%s | Server:%s | User:%s | Room:%s", mode, status, server, user, room)
 }
 
-func (a *App) renderCommandHints() string {
+func (a *App) renderCommandHints() []string {
 	if a.mode != ModeCommand || len(a.hints) == 0 {
-		return ""
+		return nil
 	}
-	var b strings.Builder
-	b.WriteString("Commands:\n")
+	lines := make([]string, 0, len(a.hints)+1)
+	lines = append(lines, "Hints:")
 	for _, hint := range a.hints {
-		b.WriteString("  ")
-		b.WriteString(hint)
-		b.WriteString("\n")
+		lines = append(lines, "  "+hint)
 	}
-	return strings.TrimRight(b.String(), "\n")
+	return lines
 }
 
 func (a *App) renderInputLine() string {
 	if a.mode == ModeCommand {
 		prefix := string(a.cfg.CommandPrefix)
 		typed := strings.TrimPrefix(a.command, prefix)
-		return fmt.Sprintf("[%c] %s", a.cfg.CommandPrefix, typed)
+		return fmt.Sprintf("%c%s%s", a.cfg.CommandPrefix, typed, cursorIndicator)
 	}
-	return a.input
+	return fmt.Sprintf("%s%s", a.input, cursorIndicator)
 }
 
 func modeLabel(mode Mode) string {
@@ -504,6 +587,7 @@ const (
 	connectTimeout     = 5 * time.Second
 	authRequestTimeout = 5 * time.Second
 	maxCommandHints    = 5
+	cursorIndicator    = "|"
 )
 
 const ackStatusError = "error"
