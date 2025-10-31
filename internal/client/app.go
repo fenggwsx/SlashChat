@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -19,7 +20,8 @@ type App struct {
 	cfg         config.ClientConfig
 	mode        Mode
 	command     string
-	input       string
+	input       []rune
+	cursor      int
 	messages    []string
 	completed   []string
 	session     *Session
@@ -30,6 +32,8 @@ type App struct {
 	hints       []string
 	viewport    viewport.Model
 	logLine     string
+	view        PrimaryView
+	keys        keyMap
 }
 
 // Mode represents the current interaction mode.
@@ -42,14 +46,32 @@ const (
 	ModeInsert
 )
 
+// PrimaryView enumerates main content panels.
+type PrimaryView int
+
+const (
+	ViewWelcome PrimaryView = iota
+	ViewChat
+	ViewDebug
+)
+
+type keyMap struct {
+	shiftEnter key.Binding
+}
+
 // NewApp returns a Bubble Tea model pre-populated with defaults.
 func NewApp(cfg config.ClientConfig) tea.Model {
 	vp := viewport.New(0, 0)
 	app := &App{
 		cfg:      cfg,
 		mode:     ModeInsert,
+		view:     ViewWelcome,
+		input:    make([]rune, 0, defaultInputCapacity),
 		messages: make([]string, 0, 128),
 		viewport: vp,
+		keys: keyMap{
+			shiftEnter: key.NewBinding(key.WithKeys("shift+enter")),
+		},
 	}
 	app.refreshViewport()
 	return app
@@ -76,11 +98,20 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return a.handleSessionClosed(m)
 	case authSendResultMsg:
 		return a.handleAuthResult(m)
+	default:
+		var cmd tea.Cmd
+		a.viewport, cmd = a.viewport.Update(m)
+		return a, cmd
 	}
 	return a, nil
 }
 
 func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if key.Matches(msg, a.keys.shiftEnter) && a.mode == ModeInsert {
+		a.insertRune('\n')
+		return a, nil
+	}
+
 	switch msg.Type {
 	case tea.KeyPgUp:
 		a.scrollMessages(a.viewport.Height)
@@ -89,97 +120,264 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		a.scrollMessages(-a.viewport.Height)
 		return a, nil
 	case tea.KeyUp:
-		a.scrollMessages(1)
+		if a.mode == ModeInsert {
+			a.moveCursorUp()
+		} else {
+			a.scrollMessages(1)
+		}
 		return a, nil
 	case tea.KeyDown:
-		a.scrollMessages(-1)
+		if a.mode == ModeInsert {
+			a.moveCursorDown()
+		} else {
+			a.scrollMessages(-1)
+		}
+		return a, nil
+	case tea.KeyLeft:
+		a.moveCursorLeft()
+		return a, nil
+	case tea.KeyRight:
+		a.moveCursorRight()
+		return a, nil
+	case tea.KeyHome:
+		a.moveCursorStart()
+		return a, nil
+	case tea.KeyEnd:
+		a.moveCursorEnd()
 		return a, nil
 	case tea.KeyEsc:
 		a.mode = ModeInsert
 		a.command = ""
 		a.hints = nil
+		return a, nil
 	case tea.KeyEnter:
 		return a.handleEnter()
 	case tea.KeyBackspace:
 		a.backspace()
-	default:
-		a.captureInput(msg.String())
+		return a, nil
+	case tea.KeyDelete:
+		a.deleteForward()
+		return a, nil
+	case tea.KeySpace:
+		if a.mode == ModeCommand {
+			a.captureCommand(" ")
+		} else {
+			a.insertRune(' ')
+		}
+		return a, nil
 	}
+
+	if len(msg.Runes) > 0 {
+		if a.mode == ModeInsert {
+			if len(a.input) == 0 && len(msg.Runes) == 1 && msg.Runes[0] == rune(a.cfg.CommandPrefix) {
+				a.mode = ModeCommand
+				a.command = string(a.cfg.CommandPrefix)
+				a.updateHints()
+				return a, nil
+			}
+			a.insertRunes(msg.Runes)
+			return a, nil
+		}
+		a.captureCommand(string(msg.Runes))
+		return a, nil
+	}
+
 	return a, nil
 }
 
-func (a *App) captureInput(value string) {
+func (a *App) captureCommand(value string) {
 	if value == "" {
 		return
 	}
-	if a.mode == ModeCommand {
-		prefix := string(a.cfg.CommandPrefix)
-		if len(a.command) == 0 {
-			if value != prefix {
-				return
-			}
-			a.command = value
-			a.updateHints()
-			return
-		}
-		a.command += value
-		a.updateHints()
+	if a.mode != ModeCommand {
 		return
 	}
-	prefix := string(a.cfg.CommandPrefix)
-	if len(a.input) == 0 && value == prefix {
-		a.mode = ModeCommand
-		a.command = prefix
-		a.updateHints()
-		return
+	if len(a.command) == 0 {
+		a.command = string(a.cfg.CommandPrefix)
 	}
-	a.input += value
+	a.command += value
+	a.updateHints()
 }
 
 func (a *App) backspace() {
 	if a.mode == ModeCommand {
-		if len(a.command) > 0 {
+		prefixLen := len(string(a.cfg.CommandPrefix))
+		if len(a.command) > prefixLen {
 			a.command = a.command[:len(a.command)-1]
-			if len(a.command) == 0 {
-				a.mode = ModeInsert
-				a.hints = nil
-				return
-			}
 			a.updateHints()
 			return
 		}
 		a.mode = ModeInsert
+		a.command = ""
 		a.hints = nil
 		return
 	}
-	if len(a.input) > 0 {
-		a.input = a.input[:len(a.input)-1]
+	if a.cursor == 0 || len(a.input) == 0 {
+		return
 	}
+	a.input = append(a.input[:a.cursor-1], a.input[a.cursor:]...)
+	a.cursor--
 }
 
 func (a *App) handleEnter() (tea.Model, tea.Cmd) {
 	if a.mode == ModeInsert {
-		if trimmed := strings.TrimSpace(a.input); trimmed != "" {
-			a.addMessage(trimmed)
-			a.completed = append(a.completed, trimmed)
+		raw := string(a.input)
+		if strings.TrimSpace(raw) != "" {
+			a.addMessage(raw)
+			a.completed = append(a.completed, raw)
 		}
-		a.input = ""
+		a.clearInput()
 		return a, nil
 	}
 
 	raw := strings.TrimSpace(a.command)
 	a.command = ""
+	a.mode = ModeInsert
+	a.hints = nil
 	if raw == "" {
-		a.mode = ModeInsert
-		a.hints = nil
 		return a, nil
 	}
 
 	a.completed = append(a.completed, raw)
-	cmd := a.executeCommand(raw)
-	a.mode = ModeInsert
-	a.hints = nil
-	return a, cmd
+	return a, a.executeCommand(raw)
+}
+
+func (a *App) insertRune(r rune) {
+	a.insertRunes([]rune{r})
+}
+
+func (a *App) insertRunes(runes []rune) {
+	if len(runes) == 0 {
+		return
+	}
+	insertion := len(runes)
+	currentLen := len(a.input)
+	a.input = append(a.input, make([]rune, insertion)...)
+	copy(a.input[a.cursor+insertion:], a.input[a.cursor:currentLen])
+	copy(a.input[a.cursor:], runes)
+	a.cursor += insertion
+}
+
+func (a *App) deleteForward() {
+	if a.mode == ModeCommand {
+		return
+	}
+	if a.cursor >= len(a.input) {
+		return
+	}
+	a.input = append(a.input[:a.cursor], a.input[a.cursor+1:]...)
+}
+
+func (a *App) moveCursorLeft() {
+	if a.mode != ModeInsert {
+		return
+	}
+	if a.cursor > 0 {
+		a.cursor--
+	}
+}
+
+func (a *App) moveCursorRight() {
+	if a.mode != ModeInsert {
+		return
+	}
+	if a.cursor < len(a.input) {
+		a.cursor++
+	}
+}
+
+func (a *App) moveCursorStart() {
+	if a.mode != ModeInsert {
+		return
+	}
+	a.cursor = 0
+}
+
+func (a *App) moveCursorEnd() {
+	if a.mode != ModeInsert {
+		return
+	}
+	a.cursor = len(a.input)
+}
+
+func (a *App) clearInput() {
+	a.input = a.input[:0]
+	a.cursor = 0
+}
+
+func (a *App) moveCursorUp() {
+	if a.mode != ModeInsert {
+		return
+	}
+	if a.cursor == 0 {
+		return
+	}
+	currentLineStart := lastIndexOfRune(a.input, '\n', a.cursor-1) + 1
+	if currentLineStart == 0 {
+		a.cursor = 0
+		return
+	}
+	prevLineEnd := currentLineStart - 1
+	prevLineStart := lastIndexOfRune(a.input, '\n', prevLineEnd-1) + 1
+	column := a.cursor - currentLineStart
+	prevLineLength := prevLineEnd - prevLineStart
+	if column > prevLineLength {
+		column = prevLineLength
+	}
+	a.cursor = prevLineStart + column
+}
+
+func (a *App) moveCursorDown() {
+	if a.mode != ModeInsert {
+		return
+	}
+	if a.cursor >= len(a.input) {
+		return
+	}
+	currentLineStart := lastIndexOfRune(a.input, '\n', a.cursor-1) + 1
+	nextBreak := indexOfRune(a.input, '\n', a.cursor)
+	if nextBreak == -1 {
+		a.cursor = len(a.input)
+		return
+	}
+	nextLineStart := nextBreak + 1
+	column := a.cursor - currentLineStart
+	nextLineEnd := indexOfRune(a.input, '\n', nextLineStart)
+	if nextLineEnd == -1 {
+		nextLineEnd = len(a.input)
+	}
+	nextLineLength := nextLineEnd - nextLineStart
+	if column > nextLineLength {
+		column = nextLineLength
+	}
+	a.cursor = nextLineStart + column
+}
+
+func lastIndexOfRune(runes []rune, target rune, before int) int {
+	if before >= len(runes) {
+		before = len(runes) - 1
+	}
+	if before < 0 {
+		return -1
+	}
+	for i := before; i >= 0; i-- {
+		if runes[i] == target {
+			return i
+		}
+	}
+	return -1
+}
+
+func indexOfRune(runes []rune, target rune, start int) int {
+	if start < 0 {
+		start = 0
+	}
+	for i := start; i < len(runes); i++ {
+		if runes[i] == target {
+			return i
+		}
+	}
+	return -1
 }
 
 func (a *App) executeCommand(raw string) tea.Cmd {
@@ -204,6 +402,15 @@ func (a *App) executeCommand(raw string) tea.Cmd {
 	switch name {
 	case "connect":
 		return a.commandConnect(args)
+	case "welcome":
+		a.setView(ViewWelcome)
+		return nil
+	case "chat":
+		a.setView(ViewChat)
+		return nil
+	case "debug":
+		a.setView(ViewDebug)
+		return nil
 	case "register":
 		return a.commandRegister(args)
 	case "login":
@@ -343,6 +550,7 @@ func (a *App) commandQuit() tea.Cmd {
 	a.username = ""
 	a.mode = ModeInsert
 	a.hints = nil
+	a.clearInput()
 	return tea.Quit
 }
 
@@ -446,6 +654,22 @@ func (a *App) addMessage(message string) {
 	a.refreshViewport()
 }
 
+func (a *App) setView(view PrimaryView) {
+	if a.view == view {
+		return
+	}
+	a.view = view
+	switch view {
+	case ViewWelcome:
+		a.log("switched to welcome view")
+	case ViewChat:
+		a.log("switched to chat view")
+		a.refreshViewport()
+	case ViewDebug:
+		a.log("switched to debug view")
+	}
+}
+
 func (a *App) refreshViewport() {
 	content := strings.Join(a.messages, "\n")
 	atBottom := a.viewport.AtBottom()
@@ -456,9 +680,12 @@ func (a *App) refreshViewport() {
 }
 
 func (a *App) scrollMessages(lines int) {
+	if a.view != ViewChat || lines == 0 {
+		return
+	}
 	if lines > 0 {
 		a.viewport.LineUp(lines)
-	} else if lines < 0 {
+	} else {
 		a.viewport.LineDown(-lines)
 	}
 }
@@ -480,22 +707,30 @@ func (a *App) resizeViewport(width, height int) {
 // View renders the terminal UI.
 func (a *App) View() string {
 	var b strings.Builder
-	b.WriteString(a.viewport.View())
-	b.WriteString("\n")
-	b.WriteString(separator())
-	b.WriteString("\n")
-	b.WriteString(a.renderInputLine())
-	b.WriteString("\n")
+	if primary := a.renderPrimaryContent(); primary != "" {
+		b.WriteString(primary)
+		b.WriteString("\n")
+	}
 	if hintLines := a.renderCommandHints(); len(hintLines) > 0 {
+		b.WriteString(separator())
+		b.WriteString("\n")
 		for _, line := range hintLines {
 			b.WriteString(line)
 			b.WriteString("\n")
 		}
 	}
+	b.WriteString(separator())
+	b.WriteString("\n")
+	b.WriteString(a.renderInputLine())
+	b.WriteString("\n")
+	b.WriteString(separator())
+	b.WriteString("\n")
 	if a.logLine != "" {
 		b.WriteString(a.logLine)
-		b.WriteString("\n")
+	} else {
+		b.WriteString(" ")
 	}
+	b.WriteString("\n")
 	b.WriteString(separator())
 	b.WriteString("\n")
 	b.WriteString(a.renderStatusBar())
@@ -504,6 +739,44 @@ func (a *App) View() string {
 
 func separator() string {
 	return strings.Repeat("-", 60)
+}
+
+func (a *App) renderPrimaryContent() string {
+	switch a.view {
+	case ViewWelcome:
+		return a.renderWelcomeView()
+	case ViewDebug:
+		return a.renderDebugView()
+	case ViewChat:
+		fallthrough
+	default:
+		return a.viewport.View()
+	}
+}
+
+func (a *App) renderWelcomeView() string {
+	lines := []string{
+		"GoSlash :: Welcome",
+		"",
+		"/connect <addr>   connect to a server",
+		"/register u p     create a new account",
+		"/login u p        authenticate",
+		"/chat | /welcome | /debug switch views",
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (a *App) renderDebugView() string {
+	lines := []string{
+		"GoSlash :: Debug",
+		fmt.Sprintf("Mode: %s", modeLabel(a.mode)),
+		fmt.Sprintf("View: %s", viewLabel(a.view)),
+		fmt.Sprintf("Messages: %d", len(a.messages)),
+		fmt.Sprintf("Cursor: %d/%d", a.cursor, len(a.input)),
+		fmt.Sprintf("Session active: %t", a.session != nil),
+		fmt.Sprintf("Pending user: %s", a.pendingUser),
+	}
+	return strings.Join(lines, "\n")
 }
 
 func (a *App) renderStatusBar() string {
@@ -528,7 +801,7 @@ func (a *App) renderStatusBar() string {
 		user = "authenticated"
 	}
 	room := "-"
-	return fmt.Sprintf("GoSlash | Mode:%s | Status:%s | Server:%s | User:%s | Room:%s", mode, status, server, user, room)
+	return fmt.Sprintf("GoSlash | Mode:%s | View:%s | Status:%s | Server:%s | User:%s | Room:%s", mode, viewLabel(a.view), status, server, user, room)
 }
 
 func (a *App) renderCommandHints() []string {
@@ -545,11 +818,11 @@ func (a *App) renderCommandHints() []string {
 
 func (a *App) renderInputLine() string {
 	if a.mode == ModeCommand {
-		prefix := string(a.cfg.CommandPrefix)
-		typed := strings.TrimPrefix(a.command, prefix)
-		return fmt.Sprintf("%c%s%s", a.cfg.CommandPrefix, typed, cursorIndicator)
+		return a.command + cursorIndicator
 	}
-	return fmt.Sprintf("%s%s", a.input, cursorIndicator)
+	before := string(a.input[:a.cursor])
+	after := string(a.input[a.cursor:])
+	return before + cursorIndicator + after
 }
 
 func modeLabel(mode Mode) string {
@@ -558,6 +831,19 @@ func modeLabel(mode Mode) string {
 		return "COMMAND"
 	case ModeInsert:
 		return "INSERT"
+	default:
+		return "UNKNOWN"
+	}
+}
+
+func viewLabel(view PrimaryView) string {
+	switch view {
+	case ViewWelcome:
+		return "WELCOME"
+	case ViewChat:
+		return "CHAT"
+	case ViewDebug:
+		return "DEBUG"
 	default:
 		return "UNKNOWN"
 	}
@@ -584,10 +870,11 @@ type authSendResultMsg struct {
 }
 
 const (
-	connectTimeout     = 5 * time.Second
-	authRequestTimeout = 5 * time.Second
-	maxCommandHints    = 5
-	cursorIndicator    = "|"
+	connectTimeout       = 5 * time.Second
+	authRequestTimeout   = 5 * time.Second
+	maxCommandHints      = 5
+	cursorIndicator      = "|"
+	defaultInputCapacity = 256
 )
 
 const ackStatusError = "error"
@@ -603,6 +890,21 @@ var commandCatalog = []commandSpec{
 		Name:        "connect",
 		Usage:       "/connect [address]",
 		Description: "Connect to a GoSlash server",
+	},
+	{
+		Name:        "welcome",
+		Usage:       "/welcome",
+		Description: "Switch to the welcome view",
+	},
+	{
+		Name:        "chat",
+		Usage:       "/chat",
+		Description: "Show chat history",
+	},
+	{
+		Name:        "debug",
+		Usage:       "/debug",
+		Description: "Show debug information",
 	},
 	{
 		Name:        "register",
