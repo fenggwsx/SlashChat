@@ -17,21 +17,21 @@ type Store struct {
 	db *gorm.DB
 }
 
-type UserModel struct {
-	ID        uint   `gorm:"primaryKey;autoIncrement"`
-	Username  string `gorm:"uniqueIndex"`
-	Password  string
-	CreatedAt time.Time
-	UpdatedAt time.Time
+type User struct {
+	ID        uint      `gorm:"primaryKey;autoIncrement"`
+	Username  string    `gorm:"uniqueIndex;not null"`
+	Password  string    `gorm:"not null"`
+	CreatedAt time.Time `gorm:"not null"`
+	UpdatedAt time.Time `gorm:"not null"`
 }
 
-type MessageModel struct {
-	ID        uint   `gorm:"primaryKey;autoIncrement"`
-	Room      string `gorm:"index"`
-	UserID    uint
-	Username  string
-	Content   string
-	CreatedAt time.Time `gorm:"index"`
+type Message struct {
+	ID        uint      `gorm:"primaryKey;autoIncrement"`
+	Room      string    `gorm:"index;not null"`
+	UserID    uint      `gorm:"not null"`
+	Username  string    `gorm:"not null"`
+	Content   string    `gorm:"not null"`
+	CreatedAt time.Time `gorm:"index;not null"`
 }
 
 // NewStore opens a SQLite database at the provided path.
@@ -54,7 +54,7 @@ func (s *Store) Close() error {
 
 // Migrate applies schema updates.
 func (s *Store) Migrate(ctx context.Context) error {
-	return s.db.WithContext(ctx).AutoMigrate(&UserModel{}, &MessageModel{})
+	return s.db.WithContext(ctx).AutoMigrate(&User{}, &Message{})
 }
 
 // CreateUser stores a new user record.
@@ -62,7 +62,7 @@ func (s *Store) CreateUser(ctx context.Context, user *storage.User) error {
 	if user == nil {
 		return errors.New("nil user")
 	}
-	model := UserModel{
+	model := User{
 		Username:  user.Username,
 		Password:  user.Password,
 		CreatedAt: user.CreatedAt,
@@ -77,7 +77,7 @@ func (s *Store) CreateUser(ctx context.Context, user *storage.User) error {
 
 // GetUserByUsername retrieves a user by username.
 func (s *Store) GetUserByUsername(ctx context.Context, username string) (*storage.User, error) {
-	var model UserModel
+	var model User
 	if err := s.db.WithContext(ctx).Where("username = ?", username).First(&model).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return nil, storage.ErrNotFound
@@ -99,7 +99,7 @@ func (s *Store) SaveMessage(ctx context.Context, msg *storage.Message) error {
 	if msg == nil {
 		return errors.New("nil message")
 	}
-	model := MessageModel{
+	model := Message{
 		Room:      msg.Room,
 		UserID:    msg.UserID,
 		Username:  msg.Username,
@@ -118,7 +118,7 @@ func (s *Store) ListMessagesByRoom(ctx context.Context, room string, limit int) 
 	if limit <= 0 {
 		limit = 50
 	}
-	var models []MessageModel
+	var models []Message
 	if err := s.db.WithContext(ctx).Where("room = ?", room).Order("created_at desc").Limit(limit).Find(&models).Error; err != nil {
 		return nil, err
 	}
