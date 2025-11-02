@@ -1171,15 +1171,15 @@ func (a *App) renderHelpView() string {
 func buildStyles() styleSet {
 	base := lipgloss.NewStyle()
 	return styleSet{
-		title:         base.Foreground(lipgloss.Color("#7D56F9")).Bold(true),
-		view:          base.Foreground(lipgloss.Color("#39B5E0")).Bold(true),
-		statusOnline:  base.Foreground(lipgloss.Color("#31C48D")).Bold(true),
-		statusOffline: base.Foreground(lipgloss.Color("#F87373")).Bold(true),
-		label:         base.Foreground(lipgloss.Color("#9399B2")),
-		value:         base.Foreground(lipgloss.Color("#E5E7EB")),
-		logLabel:      base.Foreground(lipgloss.Color("#C792EA")).Bold(true),
-		logBody:       base.Foreground(lipgloss.Color("#DADFE1")),
-		help:          base.Foreground(lipgloss.Color("#94A3B8")),
+		title:         base.Foreground(lipgloss.Color("13")).Bold(true), // bright magenta
+		view:          base.Foreground(lipgloss.Color("14")).Bold(true), // bright cyan
+		statusOnline:  base.Foreground(lipgloss.Color("10")).Bold(true), // bright green
+		statusOffline: base.Foreground(lipgloss.Color("9")).Bold(true),  // bright red
+		label:         base.Foreground(lipgloss.Color("8")),             // bright black / gray
+		value:         base.Foreground(lipgloss.Color("15")),            // bright white
+		logLabel:      base.Foreground(lipgloss.Color("11")).Bold(true), // bright yellow
+		logBody:       base.Foreground(lipgloss.Color("7")),             // white
+		help:          base.Foreground(lipgloss.Color("12")),            // bright blue
 	}
 }
 
