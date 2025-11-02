@@ -51,7 +51,7 @@ type AuthRequest struct {
 type AuthResponse struct {
 	Token     string `json:"token"`
 	ExpiresAt int64  `json:"expires_at"`
-	UserID    string `json:"user_id"`
+	UserID    uint   `json:"user_id"`
 }
 
 // JoinRequest instructs the server to subscribe the client to a room.
@@ -72,9 +72,9 @@ type ChatSendRequest struct {
 
 // ChatMessage captures a persisted/broadcast chat entry.
 type ChatMessage struct {
-	ID        string `json:"id"`
+	ID        uint   `json:"id"`
 	Room      string `json:"room"`
-	UserID    string `json:"user_id"`
+	UserID    uint   `json:"user_id"`
 	Username  string `json:"username"`
 	Content   string `json:"content"`
 	CreatedAt int64  `json:"created_at"`

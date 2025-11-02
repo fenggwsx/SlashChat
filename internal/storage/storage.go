@@ -11,7 +11,7 @@ var ErrNotFound = errors.New("storage: not found")
 
 // User represents a persisted account record.
 type User struct {
-	ID        string
+	ID        uint
 	Username  string
 	Password  string
 	CreatedAt time.Time
@@ -31,9 +31,9 @@ type Store interface {
 
 // Message represents a persisted chat message entry.
 type Message struct {
-	ID        string
+	ID        uint
 	Room      string
-	UserID    string
+	UserID    uint
 	Username  string
 	Content   string
 	CreatedAt time.Time

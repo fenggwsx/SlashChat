@@ -720,7 +720,7 @@ func (a *App) handleAuthResponse(env protocol.Envelope) {
 		message = fmt.Sprintf("%s (token expires %s)", message, expiresAt)
 	}
 
-	a.logf(message)
+	a.logf("%s", message)
 	a.lastAuthAction = ""
 	a.lastAuthUser = ""
 }

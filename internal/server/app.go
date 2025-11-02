@@ -283,7 +283,6 @@ func (a *App) handleChatSend(ctx context.Context, session *clientSession, env pr
 
 	now := time.Now().UTC()
 	msg := storage.Message{
-		ID:        uuid.NewString(),
 		Room:      room,
 		UserID:    claims.UserID,
 		Username:  claims.Username,
@@ -382,7 +381,6 @@ func (a *App) createUser(ctx context.Context, req protocol.AuthRequest) (*storag
 
 	now := time.Now().UTC()
 	user := &storage.User{
-		ID:        uuid.NewString(),
 		Username:  username,
 		Password:  hashed,
 		CreatedAt: now,

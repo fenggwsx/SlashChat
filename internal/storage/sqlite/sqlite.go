@@ -17,18 +17,18 @@ type Store struct {
 	db *gorm.DB
 }
 
-type userModel struct {
-	ID        string `gorm:"primaryKey"`
+type UserModel struct {
+	ID        uint   `gorm:"primaryKey;autoIncrement"`
 	Username  string `gorm:"uniqueIndex"`
 	Password  string
 	CreatedAt time.Time
 	UpdatedAt time.Time
 }
 
-type messageModel struct {
-	ID        string `gorm:"primaryKey"`
+type MessageModel struct {
+	ID        uint   `gorm:"primaryKey;autoIncrement"`
 	Room      string `gorm:"index"`
-	UserID    string
+	UserID    uint
 	Username  string
 	Content   string
 	CreatedAt time.Time `gorm:"index"`
@@ -54,7 +54,7 @@ func (s *Store) Close() error {
 
 // Migrate applies schema updates.
 func (s *Store) Migrate(ctx context.Context) error {
-	return s.db.WithContext(ctx).AutoMigrate(&userModel{}, &messageModel{})
+	return s.db.WithContext(ctx).AutoMigrate(&UserModel{}, &MessageModel{})
 }
 
 // CreateUser stores a new user record.
@@ -62,19 +62,22 @@ func (s *Store) CreateUser(ctx context.Context, user *storage.User) error {
 	if user == nil {
 		return errors.New("nil user")
 	}
-	model := userModel{
-		ID:        user.ID,
+	model := UserModel{
 		Username:  user.Username,
 		Password:  user.Password,
 		CreatedAt: user.CreatedAt,
 		UpdatedAt: user.UpdatedAt,
 	}
-	return s.db.WithContext(ctx).Create(&model).Error
+	if err := s.db.WithContext(ctx).Create(&model).Error; err != nil {
+		return err
+	}
+	user.ID = model.ID
+	return nil
 }
 
 // GetUserByUsername retrieves a user by username.
 func (s *Store) GetUserByUsername(ctx context.Context, username string) (*storage.User, error) {
-	var model userModel
+	var model UserModel
 	if err := s.db.WithContext(ctx).Where("username = ?", username).First(&model).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return nil, storage.ErrNotFound
@@ -96,15 +99,18 @@ func (s *Store) SaveMessage(ctx context.Context, msg *storage.Message) error {
 	if msg == nil {
 		return errors.New("nil message")
 	}
-	model := messageModel{
-		ID:        msg.ID,
+	model := MessageModel{
 		Room:      msg.Room,
 		UserID:    msg.UserID,
 		Username:  msg.Username,
 		Content:   msg.Content,
 		CreatedAt: msg.CreatedAt,
 	}
-	return s.db.WithContext(ctx).Create(&model).Error
+	if err := s.db.WithContext(ctx).Create(&model).Error; err != nil {
+		return err
+	}
+	msg.ID = model.ID
+	return nil
 }
 
 // ListMessagesByRoom returns the most recent messages for the specified room.
@@ -112,7 +118,7 @@ func (s *Store) ListMessagesByRoom(ctx context.Context, room string, limit int) 
 	if limit <= 0 {
 		limit = 50
 	}
-	var models []messageModel
+	var models []MessageModel
 	if err := s.db.WithContext(ctx).Where("room = ?", room).Order("created_at desc").Limit(limit).Find(&models).Error; err != nil {
 		return nil, err
 	}
