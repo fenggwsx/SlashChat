@@ -317,30 +317,19 @@ func (a *App) handleChatSend(ctx context.Context, session *clientSession, env pr
 	return nil
 }
 
-func (a *App) persistFileMessage(ctx context.Context, claims *auth.Claims, room, filename, sha string, fileID uint, fileMeta *storage.File) (storage.Message, error) {
+func (a *App) persistFileMessage(ctx context.Context, claims *auth.Claims, room, filename, sha string) (storage.Message, error) {
 	now := time.Now().UTC()
-	id := fileID
-	var filePtr *storage.File
-	if fileMeta != nil {
-		copy := *fileMeta
-		filePtr = &copy
-	}
-	displayName := strings.TrimSpace(filename)
-	if filePtr != nil && strings.TrimSpace(filePtr.Filename) != "" {
-		displayName = filePtr.Filename
-	}
 	msg := storage.Message{
 		Room:      room,
 		UserID:    claims.UserID,
-		Content:   displayName,
+		Content:   strings.TrimSpace(filename),
 		Kind:      string(protocol.MessageKindFile),
-		FileID:    &id,
+		FileSHA:   sha,
 		CreatedAt: now,
 		User: &storage.User{
 			ID:       claims.UserID,
 			Username: claims.Username,
 		},
-		File: filePtr,
 	}
 	if err := a.store.SaveMessage(ctx, &msg); err != nil {
 		return storage.Message{}, err
@@ -367,37 +356,6 @@ func (a *App) broadcastChatMessage(msg storage.Message) {
 	a.hub.Broadcast(event)
 }
 
-func (a *App) ensureFileMaterialized(ctx context.Context, filename, sha string, data []byte) (*storage.File, error) {
-	file, err := a.store.GetFileBySHA(ctx, sha)
-	if err == nil {
-		if err := a.writeFileIfMissing(sha, data); err != nil {
-			return nil, err
-		}
-		return file, nil
-	}
-	if !errors.Is(err, storage.ErrNotFound) {
-		return nil, err
-	}
-
-	if err := a.writeFileContent(sha, data); err != nil {
-		return nil, err
-	}
-
-	record := &storage.File{
-		Filename:  filename,
-		SHA256:    sha,
-		CreatedAt: time.Now().UTC(),
-	}
-	if err := a.store.CreateFile(ctx, record); err != nil {
-		existing, lookupErr := a.store.GetFileBySHA(ctx, sha)
-		if lookupErr != nil {
-			return nil, err
-		}
-		return existing, nil
-	}
-	return record, nil
-}
-
 func (a *App) writeFileIfMissing(sha string, data []byte) error {
 	path, err := a.uploadFilePath(sha)
 	if err != nil {
@@ -411,12 +369,15 @@ func (a *App) writeFileIfMissing(sha string, data []byte) error {
 	return os.WriteFile(path, data, 0o600)
 }
 
-func (a *App) writeFileContent(sha string, data []byte) error {
+func (a *App) fileExists(sha string) bool {
 	path, err := a.uploadFilePath(sha)
 	if err != nil {
-		return err
+		return false
 	}
-	return os.WriteFile(path, data, 0o600)
+	if _, err := os.Stat(path); err == nil {
+		return true
+	}
+	return false
 }
 
 func (a *App) uploadFilePath(sha string) (string, error) {
@@ -444,21 +405,12 @@ func normalizeSHA(sha string) string {
 
 func toProtocolChatMessage(msg storage.Message) protocol.ChatMessage {
 	kind := toProtocolKind(msg.Kind)
-	var fileID uint
-	if msg.FileID != nil {
-		fileID = *msg.FileID
-	}
 	username := ""
 	if msg.User != nil {
 		username = msg.User.Username
 	}
 	filename := ""
-	sha := ""
-	if msg.File != nil {
-		filename = msg.File.Filename
-		sha = msg.File.SHA256
-	}
-	if filename == "" && kind == protocol.MessageKindFile {
+	if kind == protocol.MessageKindFile {
 		filename = msg.Content
 	}
 	return protocol.ChatMessage{
@@ -468,9 +420,8 @@ func toProtocolChatMessage(msg storage.Message) protocol.ChatMessage {
 		Username:  username,
 		Content:   msg.Content,
 		Kind:      kind,
-		FileID:    fileID,
 		Filename:  filename,
-		SHA256:    sha,
+		SHA256:    msg.FileSHA,
 		CreatedAt: msg.CreatedAt.Unix(),
 	}
 }
@@ -515,17 +466,12 @@ func (a *App) handleFileUploadPrepare(ctx context.Context, session *clientSessio
 		return nil
 	}
 
-	file, err := a.store.GetFileBySHA(ctx, sha)
-	if err != nil {
-		if errors.Is(err, storage.ErrNotFound) {
-			a.sendAck(ctx, session, env.ID, ackStatusUploadRequired, "upload required")
-			return nil
-		}
-		a.sendAck(ctx, session, env.ID, ackStatusError, "lookup failed")
-		return err
+	if !a.fileExists(sha) {
+		a.sendAck(ctx, session, env.ID, ackStatusUploadRequired, "upload required")
+		return nil
 	}
 
-	msg, err := a.persistFileMessage(ctx, claims, room, filename, sha, file.ID, file)
+	msg, err := a.persistFileMessage(ctx, claims, room, filename, sha)
 	if err != nil {
 		a.sendAck(ctx, session, env.ID, ackStatusError, "message not stored")
 		return err
@@ -583,13 +529,12 @@ func (a *App) handleFileUploadData(ctx context.Context, session *clientSession, 
 		return nil
 	}
 
-	file, err := a.ensureFileMaterialized(ctx, filename, computed, data)
-	if err != nil {
+	if err := a.writeFileIfMissing(computed, data); err != nil {
 		a.sendAck(ctx, session, env.ID, ackStatusError, "upload failed")
 		return err
 	}
 
-	msg, err := a.persistFileMessage(ctx, claims, room, filename, computed, file.ID, file)
+	msg, err := a.persistFileMessage(ctx, claims, room, filename, computed)
 	if err != nil {
 		a.sendAck(ctx, session, env.ID, ackStatusError, "message not stored")
 		return err

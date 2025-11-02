@@ -979,9 +979,6 @@ func (a *App) renderMessageBody(msg protocol.ChatMessage) string {
 		if name == "" {
 			name = strings.TrimSpace(msg.Content)
 		}
-		if name == "" && msg.FileID != 0 {
-			name = fmt.Sprintf("file #%d", msg.FileID)
-		}
 		if name == "" {
 			name = "file"
 		}

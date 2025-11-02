@@ -103,7 +103,6 @@ type ChatMessage struct {
 	Username  string      `json:"username"`
 	Content   string      `json:"content"`
 	Kind      MessageKind `json:"kind"`
-	FileID    uint        `json:"file_id,omitempty"`
 	Filename  string      `json:"filename,omitempty"`
 	SHA256    string      `json:"sha256,omitempty"`
 	CreatedAt int64       `json:"created_at"`
