@@ -2,8 +2,12 @@ package client
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -80,6 +84,11 @@ type pendingRequest struct {
 	action   string
 	username string
 	room     string
+	filePath string
+	fileName string
+	sha      string
+	data     string
+	size     int64
 }
 
 type connectResultMsg struct {
@@ -239,7 +248,10 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.session != a.session {
 			return a, nil
 		}
-		a.handleSessionEnvelope(m.envelope)
+		cmd := a.handleSessionEnvelope(m.envelope)
+		if cmd != nil {
+			return a, tea.Batch(cmd, a.listenForSession())
+		}
 		return a, a.listenForSession()
 
 	case sessionClosedMsg:
@@ -388,6 +400,24 @@ func (a *App) executeCommand(raw string) tea.Cmd {
 		a.logf("Registering %s ...", username)
 		if authCmd := a.sendAuthCommand("register", username, password); authCmd != nil {
 			cmds = append(cmds, authCmd)
+		}
+	case "/upload":
+		if len(fields) < 2 {
+			a.logf("Usage: /upload <path>")
+			break
+		}
+		if !a.isConnected() {
+			a.logf("Not connected. Use /connect first.")
+			break
+		}
+		activeRoom := strings.TrimSpace(a.room)
+		if activeRoom == "" || activeRoom == "-" {
+			a.logf("Join a room before uploading")
+			break
+		}
+		path := strings.Join(fields[1:], " ")
+		if uploadCmd := a.startFileUpload(path); uploadCmd != nil {
+			cmds = append(cmds, uploadCmd)
 		}
 	case "/login":
 		if len(fields) < 3 {
@@ -559,6 +589,121 @@ func (a *App) sendLeaveCommand(room string) tea.Cmd {
 	return a.sendEnvelope(session, env, fmt.Sprintf("leave %s", room), true)
 }
 
+func (a *App) startFileUpload(path string) tea.Cmd {
+	session := a.session
+	if session == nil {
+		return nil
+	}
+	room := strings.TrimSpace(a.room)
+	if room == "" || room == "-" {
+		a.logf("Join a room before uploading")
+		return nil
+	}
+	path = strings.TrimSpace(path)
+	if path == "" {
+		a.logf("Usage: /upload <path>")
+		return nil
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		a.logf("Cannot access %s: %v", path, err)
+		return nil
+	}
+	if info.IsDir() {
+		a.logf("Cannot upload a directory")
+		return nil
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		a.logf("Cannot read %s: %v", path, err)
+		return nil
+	}
+	sum := sha256.Sum256(data)
+	sha := fmt.Sprintf("%x", sum[:])
+	encoded := base64.StdEncoding.EncodeToString(data)
+	filename := filepath.Base(path)
+	size := info.Size()
+
+	if a.pendingRequests == nil {
+		a.pendingRequests = make(map[string]pendingRequest)
+	}
+	requestID := uuid.NewString()
+	a.pendingRequests[requestID] = pendingRequest{
+		action:   "file_upload_prepare",
+		room:     room,
+		filePath: path,
+		fileName: filename,
+		sha:      sha,
+		data:     encoded,
+		size:     size,
+	}
+
+	a.logf("Preparing to upload %s (%d bytes) to %s ...", filename, size, room)
+
+	env := protocol.Envelope{
+		ID:   requestID,
+		Type: protocol.MessageTypeCommand,
+		Metadata: map[string]interface{}{
+			"action": "file_upload_prepare",
+			"room":   room,
+		},
+		Payload: protocol.FileUploadRequest{
+			Room:     room,
+			Filename: filename,
+			SHA256:   sha,
+			Size:     size,
+		},
+	}
+
+	return a.sendEnvelope(session, env, "file upload prepare", true)
+}
+
+func (a *App) sendFileUpload(p pendingRequest) tea.Cmd {
+	session := a.session
+	if session == nil {
+		return nil
+	}
+	room := strings.TrimSpace(p.room)
+	if room == "" || room == "-" {
+		a.logf("No active room to receive upload")
+		return nil
+	}
+	if strings.TrimSpace(p.data) == "" {
+		a.logf("No file data available for upload")
+		return nil
+	}
+	if a.pendingRequests == nil {
+		a.pendingRequests = make(map[string]pendingRequest)
+	}
+	requestID := uuid.NewString()
+	a.pendingRequests[requestID] = pendingRequest{
+		action:   "file_upload",
+		room:     room,
+		fileName: p.fileName,
+		sha:      p.sha,
+		size:     p.size,
+	}
+
+	a.logf("Uploading %s to %s ...", p.fileName, room)
+
+	env := protocol.Envelope{
+		ID:   requestID,
+		Type: protocol.MessageTypeFileUpload,
+		Metadata: map[string]interface{}{
+			"room":   room,
+			"action": "file_upload",
+		},
+		Payload: protocol.FileUploadPayload{
+			Room:       room,
+			Filename:   p.fileName,
+			SHA256:     p.sha,
+			DataBase64: p.data,
+		},
+	}
+
+	return a.sendEnvelope(session, env, "file upload", true)
+}
+
 func (a *App) sendChatMessage(content string) tea.Cmd {
 	content = strings.TrimSpace(content)
 	if content == "" {
@@ -619,10 +764,10 @@ func (a *App) sendEnvelope(session *Session, env protocol.Envelope, description 
 	}
 }
 
-func (a *App) handleSessionEnvelope(env protocol.Envelope) {
+func (a *App) handleSessionEnvelope(env protocol.Envelope) tea.Cmd {
 	switch env.Type {
 	case protocol.MessageTypeAck:
-		a.handleAckEnvelope(env)
+		return a.handleAckEnvelope(env)
 	case protocol.MessageTypeAuthResponse:
 		a.handleAuthResponse(env)
 	case protocol.MessageTypeEvent:
@@ -630,13 +775,14 @@ func (a *App) handleSessionEnvelope(env protocol.Envelope) {
 	default:
 		a.logf("Received %s message", string(env.Type))
 	}
+	return nil
 }
 
-func (a *App) handleAckEnvelope(env protocol.Envelope) {
+func (a *App) handleAckEnvelope(env protocol.Envelope) tea.Cmd {
 	ack, err := decodeAckPayload(env.Payload)
 	if err != nil {
 		a.logf("Failed to decode ack: %v", err)
-		return
+		return nil
 	}
 
 	pending, ok := a.pendingRequests[ack.ReferenceID]
@@ -644,14 +790,15 @@ func (a *App) handleAckEnvelope(env protocol.Envelope) {
 		if ack.Reason != "" {
 			a.logf("Server response: %s", ack.Reason)
 		}
-		return
+		return nil
 	}
 	delete(a.pendingRequests, ack.ReferenceID)
 
-	statusOK := strings.EqualFold(ack.Status, "ok")
+	status := strings.ToLower(strings.TrimSpace(ack.Status))
 	action := strings.ToLower(pending.action)
 
-	if statusOK {
+	switch status {
+	case "ok":
 		switch action {
 		case "register":
 			a.logf("Registration accepted for %s", pending.username)
@@ -666,6 +813,10 @@ func (a *App) handleAckEnvelope(env protocol.Envelope) {
 				a.chatHistory = nil
 				a.updateViewportContent()
 			}
+		case "file_upload_prepare":
+			a.logf("Upload skipped; server already has %s", pending.fileName)
+		case "file_upload":
+			a.logf("Uploaded %s to %s", pending.fileName, pending.room)
 		case "chat_send":
 			a.logf("Message delivered to %s", pending.room)
 		default:
@@ -675,30 +826,42 @@ func (a *App) handleAckEnvelope(env protocol.Envelope) {
 			a.lastAuthAction = pending.action
 			a.lastAuthUser = pending.username
 		}
-		return
-	}
-
-	reason := ack.Reason
-	if strings.TrimSpace(reason) == "" {
-		reason = "unknown error"
-	}
-	switch action {
-	case "register":
-		a.logf("Registration failed: %s", reason)
-	case "login":
-		a.logf("Login failed: %s", reason)
-	case "join":
-		a.logf("Join failed: %s", reason)
-	case "leave":
-		a.logf("Leave failed: %s", reason)
-	case "chat_send":
-		a.logf("Message failed: %s", reason)
+		return nil
+	case "upload_required":
+		if action == "file_upload_prepare" {
+			a.logf("Server requested upload for %s", pending.fileName)
+			return a.sendFileUpload(pending)
+		}
+		a.logf("Server requested upload retry")
+		return nil
 	default:
-		a.logf("Command %s failed: %s", pending.action, reason)
-	}
-	if action == "register" || action == "login" {
-		a.lastAuthAction = ""
-		a.lastAuthUser = ""
+		reason := strings.TrimSpace(ack.Reason)
+		if reason == "" {
+			reason = "unknown error"
+		}
+		switch action {
+		case "register":
+			a.logf("Registration failed: %s", reason)
+		case "login":
+			a.logf("Login failed: %s", reason)
+		case "join":
+			a.logf("Join failed: %s", reason)
+		case "leave":
+			a.logf("Leave failed: %s", reason)
+		case "chat_send":
+			a.logf("Message failed: %s", reason)
+		case "file_upload_prepare":
+			a.logf("Upload prepare failed: %s", reason)
+		case "file_upload":
+			a.logf("Upload failed: %s", reason)
+		default:
+			a.logf("Command %s failed: %s", pending.action, reason)
+		}
+		if action == "register" || action == "login" {
+			a.lastAuthAction = ""
+			a.lastAuthUser = ""
+		}
+		return nil
 	}
 }
 
@@ -794,16 +957,45 @@ func (a *App) appendChatLine(line string) {
 }
 
 func (a *App) formatChatMessage(msg protocol.ChatMessage) string {
-	content := strings.TrimSpace(msg.Content)
 	username := strings.TrimSpace(msg.Username)
+	if username == "" {
+		username = "unknown"
+	}
 	timestamp := ""
 	if msg.CreatedAt > 0 {
 		timestamp = time.Unix(msg.CreatedAt, 0).Local().Format("15:04:05")
 	}
+	body := a.renderMessageBody(msg)
 	if timestamp != "" {
-		return fmt.Sprintf("[%s] %s: %s", timestamp, username, content)
+		return fmt.Sprintf("[%s] %s: %s", timestamp, username, body)
 	}
-	return fmt.Sprintf("%s: %s", username, content)
+	return fmt.Sprintf("%s: %s", username, body)
+}
+
+func (a *App) renderMessageBody(msg protocol.ChatMessage) string {
+	switch msg.Kind {
+	case protocol.MessageKindFile:
+		name := strings.TrimSpace(msg.Filename)
+		if name == "" {
+			name = strings.TrimSpace(msg.Content)
+		}
+		if name == "" && msg.FileID != 0 {
+			name = fmt.Sprintf("file #%d", msg.FileID)
+		}
+		if name == "" {
+			name = "file"
+		}
+		if msg.SHA256 != "" {
+			return fmt.Sprintf("uploaded file %s (sha256: %s)", name, msg.SHA256)
+		}
+		return fmt.Sprintf("uploaded file %s", name)
+	default:
+		content := strings.TrimSpace(msg.Content)
+		if content == "" {
+			content = "(empty)"
+		}
+		return content
+	}
 }
 
 func (a *App) updateViewportContent() {

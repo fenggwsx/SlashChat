@@ -27,6 +27,8 @@ type Store interface {
 	GetUserByUsername(ctx context.Context, username string) (*User, error)
 	SaveMessage(ctx context.Context, msg *Message) error
 	ListMessagesByRoom(ctx context.Context, room string, limit int) ([]Message, error)
+	CreateFile(ctx context.Context, file *File) error
+	GetFileBySHA(ctx context.Context, sha string) (*File, error)
 }
 
 // Message represents a persisted chat message entry.
@@ -34,7 +36,18 @@ type Message struct {
 	ID        uint
 	Room      string
 	UserID    uint
-	Username  string
 	Content   string
+	Kind      string
+	FileID    *uint
+	CreatedAt time.Time
+	User      *User
+	File      *File
+}
+
+// File captures metadata for uploaded artifacts.
+type File struct {
+	ID        uint
+	Filename  string
+	SHA256    string
 	CreatedAt time.Time
 }

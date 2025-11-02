@@ -12,6 +12,15 @@ const (
 	MessageTypeCommand      MessageType = "command"
 	MessageTypeAck          MessageType = "ack"
 	MessageTypeFileChunk    MessageType = "file_chunk"
+	MessageTypeFileUpload   MessageType = "file_upload"
+)
+
+// MessageKind distinguishes persisted chat payload semantics.
+type MessageKind string
+
+const (
+	MessageKindText MessageKind = "text"
+	MessageKindFile MessageKind = "file"
 )
 
 // Envelope wraps every payload sent over the wire.
@@ -38,6 +47,22 @@ type FileChunkPayload struct {
 	Index       int    `json:"index"`
 	TotalChunks int    `json:"total_chunks"`
 	DataBase64  string `json:"data_base64"`
+}
+
+// FileUploadRequest initiates a file upload negotiation.
+type FileUploadRequest struct {
+	Room     string `json:"room"`
+	Filename string `json:"filename"`
+	SHA256   string `json:"sha256"`
+	Size     int64  `json:"size"`
+}
+
+// FileUploadPayload transports a complete file payload.
+type FileUploadPayload struct {
+	Room       string `json:"room"`
+	Filename   string `json:"filename"`
+	SHA256     string `json:"sha256"`
+	DataBase64 string `json:"data_base64"`
 }
 
 // AuthRequest carries login or registration data.
@@ -72,12 +97,16 @@ type ChatSendRequest struct {
 
 // ChatMessage captures a persisted/broadcast chat entry.
 type ChatMessage struct {
-	ID        uint   `json:"id"`
-	Room      string `json:"room"`
-	UserID    uint   `json:"user_id"`
-	Username  string `json:"username"`
-	Content   string `json:"content"`
-	CreatedAt int64  `json:"created_at"`
+	ID        uint        `json:"id"`
+	Room      string      `json:"room"`
+	UserID    uint        `json:"user_id"`
+	Username  string      `json:"username"`
+	Content   string      `json:"content"`
+	Kind      MessageKind `json:"kind"`
+	FileID    uint        `json:"file_id,omitempty"`
+	Filename  string      `json:"filename,omitempty"`
+	SHA256    string      `json:"sha256,omitempty"`
+	CreatedAt int64       `json:"created_at"`
 }
 
 // ChatHistory bundles a batch of chat messages for a room.

@@ -14,6 +14,7 @@ type ServerConfig struct {
 	ReadTimeout   time.Duration
 	WriteTimeout  time.Duration
 	MaxFrameBytes int
+	UploadDir     string
 }
 
 // ClientConfig holds settings for the terminal client.
@@ -43,6 +44,7 @@ func LoadServerConfig() ServerConfig {
 		ReadTimeout:   envDuration("GOSLASH_READ_TIMEOUT", 15*time.Second),
 		WriteTimeout:  envDuration("GOSLASH_WRITE_TIMEOUT", 15*time.Second),
 		MaxFrameBytes: envInt("GOSLASH_MAX_FRAME_BYTES", 1<<20),
+		UploadDir:     envOrDefault("GOSLASH_UPLOAD_DIR", "uploads"),
 	}
 }
 

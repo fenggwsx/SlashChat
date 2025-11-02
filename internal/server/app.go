@@ -2,12 +2,16 @@ package server
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -27,14 +31,22 @@ type App struct {
 	hub       *RoomHub
 	listener  net.Listener
 	closeOnce sync.Once
+	uploadDir string
 }
+
+const defaultUploadDir = "uploads"
 
 // NewApp constructs a server instance using the provided dependencies.
 func NewApp(cfg config.ServerConfig, store storage.Store) *App {
+	dir := strings.TrimSpace(cfg.UploadDir)
+	if dir == "" {
+		dir = defaultUploadDir
+	}
 	return &App{
-		cfg:   cfg,
-		store: store,
-		hub:   NewRoomHub(),
+		cfg:       cfg,
+		store:     store,
+		hub:       NewRoomHub(),
+		uploadDir: dir,
 	}
 }
 
@@ -42,6 +54,10 @@ func NewApp(cfg config.ServerConfig, store storage.Store) *App {
 func (a *App) Run(ctx context.Context) error {
 	if err := a.store.Migrate(ctx); err != nil {
 		return fmt.Errorf("migrate: %w", err)
+	}
+
+	if _, err := a.ensureUploadsDir(); err != nil {
+		return fmt.Errorf("uploads dir: %w", err)
 	}
 
 	listener, err := net.Listen("tcp", a.cfg.ListenAddr)
@@ -133,6 +149,8 @@ func (a *App) routeEnvelope(ctx context.Context, session *clientSession, env pro
 	case protocol.MessageTypeFileChunk:
 		// File handling not yet implemented.
 		return nil
+	case protocol.MessageTypeFileUpload:
+		return a.handleFileUploadData(ctx, session, env)
 	default:
 		log.Printf("unhandled envelope type: %s", env.Type)
 	}
@@ -165,6 +183,8 @@ func (a *App) handleCommand(ctx context.Context, session *clientSession, env pro
 		return a.handleJoinCommand(ctx, session, env)
 	case "leave":
 		return a.handleLeaveCommand(ctx, session, env)
+	case "file_upload_prepare":
+		return a.handleFileUploadPrepare(ctx, session, env)
 	default:
 		a.sendAck(ctx, session, env.ID, ackStatusError, "unsupported command")
 	}
@@ -211,14 +231,7 @@ func (a *App) handleJoinCommand(ctx context.Context, session *clientSession, env
 
 	history := protocol.ChatHistory{Room: room, Messages: make([]protocol.ChatMessage, 0, len(messages))}
 	for _, msg := range messages {
-		history.Messages = append(history.Messages, protocol.ChatMessage{
-			ID:        msg.ID,
-			Room:      msg.Room,
-			UserID:    msg.UserID,
-			Username:  msg.Username,
-			Content:   msg.Content,
-			CreatedAt: msg.CreatedAt.Unix(),
-		})
+		history.Messages = append(history.Messages, toProtocolChatMessage(msg))
 	}
 
 	event := protocol.Envelope{
@@ -285,9 +298,13 @@ func (a *App) handleChatSend(ctx context.Context, session *clientSession, env pr
 	msg := storage.Message{
 		Room:      room,
 		UserID:    claims.UserID,
-		Username:  claims.Username,
 		Content:   content,
+		Kind:      string(protocol.MessageKindText),
 		CreatedAt: now,
+		User: &storage.User{
+			ID:       claims.UserID,
+			Username: claims.Username,
+		},
 	}
 	if err := a.store.SaveMessage(ctx, &msg); err != nil {
 		a.sendAck(ctx, session, env.ID, ackStatusError, "message not stored")
@@ -296,24 +313,290 @@ func (a *App) handleChatSend(ctx context.Context, session *clientSession, env pr
 
 	a.sendAck(ctx, session, env.ID, ackStatusOK, "")
 
-	broadcast := protocol.Envelope{
+	a.broadcastChatMessage(msg)
+	return nil
+}
+
+func (a *App) persistFileMessage(ctx context.Context, claims *auth.Claims, room, filename, sha string, fileID uint, fileMeta *storage.File) (storage.Message, error) {
+	now := time.Now().UTC()
+	id := fileID
+	var filePtr *storage.File
+	if fileMeta != nil {
+		copy := *fileMeta
+		filePtr = &copy
+	}
+	displayName := strings.TrimSpace(filename)
+	if filePtr != nil && strings.TrimSpace(filePtr.Filename) != "" {
+		displayName = filePtr.Filename
+	}
+	msg := storage.Message{
+		Room:      room,
+		UserID:    claims.UserID,
+		Content:   displayName,
+		Kind:      string(protocol.MessageKindFile),
+		FileID:    &id,
+		CreatedAt: now,
+		User: &storage.User{
+			ID:       claims.UserID,
+			Username: claims.Username,
+		},
+		File: filePtr,
+	}
+	if err := a.store.SaveMessage(ctx, &msg); err != nil {
+		return storage.Message{}, err
+	}
+	return msg, nil
+}
+
+func (a *App) broadcastChatMessage(msg storage.Message) {
+	payload := toProtocolChatMessage(msg)
+	timestamp := msg.CreatedAt
+	if timestamp.IsZero() {
+		timestamp = time.Now()
+	}
+	event := protocol.Envelope{
 		ID:        uuid.NewString(),
 		Type:      protocol.MessageTypeEvent,
-		Timestamp: now,
+		Timestamp: timestamp,
 		Metadata: map[string]interface{}{
 			"action": "chat_message",
-			"room":   room,
+			"room":   msg.Room,
 		},
-		Payload: protocol.ChatMessage{
-			ID:        msg.ID,
-			Room:      msg.Room,
-			UserID:    msg.UserID,
-			Username:  msg.Username,
-			Content:   msg.Content,
-			CreatedAt: msg.CreatedAt.Unix(),
-		},
+		Payload: payload,
 	}
-	a.hub.Broadcast(broadcast)
+	a.hub.Broadcast(event)
+}
+
+func (a *App) ensureFileMaterialized(ctx context.Context, filename, sha string, data []byte) (*storage.File, error) {
+	file, err := a.store.GetFileBySHA(ctx, sha)
+	if err == nil {
+		if err := a.writeFileIfMissing(sha, data); err != nil {
+			return nil, err
+		}
+		return file, nil
+	}
+	if !errors.Is(err, storage.ErrNotFound) {
+		return nil, err
+	}
+
+	if err := a.writeFileContent(sha, data); err != nil {
+		return nil, err
+	}
+
+	record := &storage.File{
+		Filename:  filename,
+		SHA256:    sha,
+		CreatedAt: time.Now().UTC(),
+	}
+	if err := a.store.CreateFile(ctx, record); err != nil {
+		existing, lookupErr := a.store.GetFileBySHA(ctx, sha)
+		if lookupErr != nil {
+			return nil, err
+		}
+		return existing, nil
+	}
+	return record, nil
+}
+
+func (a *App) writeFileIfMissing(sha string, data []byte) error {
+	path, err := a.uploadFilePath(sha)
+	if err != nil {
+		return err
+	}
+	if _, err := os.Stat(path); err == nil {
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return os.WriteFile(path, data, 0o600)
+}
+
+func (a *App) writeFileContent(sha string, data []byte) error {
+	path, err := a.uploadFilePath(sha)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0o600)
+}
+
+func (a *App) uploadFilePath(sha string) (string, error) {
+	dir, err := a.ensureUploadsDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, sha), nil
+}
+
+func (a *App) ensureUploadsDir() (string, error) {
+	dir := strings.TrimSpace(a.uploadDir)
+	if dir == "" {
+		dir = defaultUploadDir
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
+	}
+	return dir, nil
+}
+
+func normalizeSHA(sha string) string {
+	return strings.ToLower(strings.TrimSpace(sha))
+}
+
+func toProtocolChatMessage(msg storage.Message) protocol.ChatMessage {
+	kind := toProtocolKind(msg.Kind)
+	var fileID uint
+	if msg.FileID != nil {
+		fileID = *msg.FileID
+	}
+	username := ""
+	if msg.User != nil {
+		username = msg.User.Username
+	}
+	filename := ""
+	sha := ""
+	if msg.File != nil {
+		filename = msg.File.Filename
+		sha = msg.File.SHA256
+	}
+	if filename == "" && kind == protocol.MessageKindFile {
+		filename = msg.Content
+	}
+	return protocol.ChatMessage{
+		ID:        msg.ID,
+		Room:      msg.Room,
+		UserID:    msg.UserID,
+		Username:  username,
+		Content:   msg.Content,
+		Kind:      kind,
+		FileID:    fileID,
+		Filename:  filename,
+		SHA256:    sha,
+		CreatedAt: msg.CreatedAt.Unix(),
+	}
+}
+
+func toProtocolKind(kind string) protocol.MessageKind {
+	switch protocol.MessageKind(strings.TrimSpace(kind)) {
+	case protocol.MessageKindFile:
+		return protocol.MessageKindFile
+	default:
+		return protocol.MessageKindText
+	}
+}
+
+func (a *App) handleFileUploadPrepare(ctx context.Context, session *clientSession, env protocol.Envelope) error {
+	claims, err := a.claimsFromEnvelope(env)
+	if err != nil {
+		a.sendAck(ctx, session, env.ID, ackStatusError, "unauthorized")
+		return nil
+	}
+	req, err := decodeFileUploadRequest(env.Payload)
+	if err != nil {
+		a.sendAck(ctx, session, env.ID, ackStatusError, "invalid upload payload")
+		return nil
+	}
+	room := strings.TrimSpace(req.Room)
+	if room == "" {
+		a.sendAck(ctx, session, env.ID, ackStatusError, "room required")
+		return nil
+	}
+	if !session.inRoom(room) {
+		a.sendAck(ctx, session, env.ID, ackStatusError, "join room first")
+		return nil
+	}
+	filename := strings.TrimSpace(req.Filename)
+	if filename == "" {
+		a.sendAck(ctx, session, env.ID, ackStatusError, "filename required")
+		return nil
+	}
+	sha := normalizeSHA(req.SHA256)
+	if sha == "" {
+		a.sendAck(ctx, session, env.ID, ackStatusError, "sha256 required")
+		return nil
+	}
+
+	file, err := a.store.GetFileBySHA(ctx, sha)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			a.sendAck(ctx, session, env.ID, ackStatusUploadRequired, "upload required")
+			return nil
+		}
+		a.sendAck(ctx, session, env.ID, ackStatusError, "lookup failed")
+		return err
+	}
+
+	msg, err := a.persistFileMessage(ctx, claims, room, filename, sha, file.ID, file)
+	if err != nil {
+		a.sendAck(ctx, session, env.ID, ackStatusError, "message not stored")
+		return err
+	}
+
+	a.sendAck(ctx, session, env.ID, ackStatusOK, "")
+	a.broadcastChatMessage(msg)
+	return nil
+}
+
+func (a *App) handleFileUploadData(ctx context.Context, session *clientSession, env protocol.Envelope) error {
+	claims, err := a.claimsFromEnvelope(env)
+	if err != nil {
+		a.sendAck(ctx, session, env.ID, ackStatusError, "unauthorized")
+		return nil
+	}
+	payload, err := decodeFileUploadPayload(env.Payload)
+	if err != nil {
+		a.sendAck(ctx, session, env.ID, ackStatusError, "invalid upload payload")
+		return nil
+	}
+
+	room := strings.TrimSpace(payload.Room)
+	if room == "" {
+		a.sendAck(ctx, session, env.ID, ackStatusError, "room required")
+		return nil
+	}
+	if !session.inRoom(room) {
+		a.sendAck(ctx, session, env.ID, ackStatusError, "join room first")
+		return nil
+	}
+
+	filename := strings.TrimSpace(payload.Filename)
+	if filename == "" {
+		a.sendAck(ctx, session, env.ID, ackStatusError, "filename required")
+		return nil
+	}
+
+	sha := normalizeSHA(payload.SHA256)
+	if sha == "" {
+		a.sendAck(ctx, session, env.ID, ackStatusError, "sha256 required")
+		return nil
+	}
+
+	data, err := base64.StdEncoding.DecodeString(payload.DataBase64)
+	if err != nil {
+		a.sendAck(ctx, session, env.ID, ackStatusError, "invalid data encoding")
+		return nil
+	}
+
+	sum := sha256.Sum256(data)
+	computed := fmt.Sprintf("%x", sum[:])
+	if !strings.EqualFold(computed, sha) {
+		a.sendAck(ctx, session, env.ID, ackStatusError, "sha256 mismatch")
+		return nil
+	}
+
+	file, err := a.ensureFileMaterialized(ctx, filename, computed, data)
+	if err != nil {
+		a.sendAck(ctx, session, env.ID, ackStatusError, "upload failed")
+		return err
+	}
+
+	msg, err := a.persistFileMessage(ctx, claims, room, filename, computed, file.ID, file)
+	if err != nil {
+		a.sendAck(ctx, session, env.ID, ackStatusError, "message not stored")
+		return err
+	}
+
+	a.sendAck(ctx, session, env.ID, ackStatusOK, "")
+	a.broadcastChatMessage(msg)
 	return nil
 }
 
@@ -497,6 +780,36 @@ func decodeChatSendRequest(payload interface{}) (protocol.ChatSendRequest, error
 	return req, nil
 }
 
+func decodeFileUploadRequest(payload interface{}) (protocol.FileUploadRequest, error) {
+	var req protocol.FileUploadRequest
+	if payload == nil {
+		return req, errInvalidPayload
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return req, err
+	}
+	if err := json.Unmarshal(data, &req); err != nil {
+		return req, err
+	}
+	return req, nil
+}
+
+func decodeFileUploadPayload(payload interface{}) (protocol.FileUploadPayload, error) {
+	var req protocol.FileUploadPayload
+	if payload == nil {
+		return req, errInvalidPayload
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return req, err
+	}
+	if err := json.Unmarshal(data, &req); err != nil {
+		return req, err
+	}
+	return req, nil
+}
+
 func (a *App) claimsFromEnvelope(env protocol.Envelope) (*auth.Claims, error) {
 	token := strings.TrimSpace(env.Token)
 	if token == "" {
@@ -534,8 +847,9 @@ func (a *App) sendAck(ctx context.Context, session *clientSession, referenceID, 
 }
 
 const (
-	ackStatusOK    = "ok"
-	ackStatusError = "error"
+	ackStatusOK             = "ok"
+	ackStatusError          = "error"
+	ackStatusUploadRequired = "upload_required"
 )
 
 var (
