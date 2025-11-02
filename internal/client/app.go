@@ -1,980 +1,476 @@
 package client
 
 import (
-	"context"
-	"encoding/json"
 	"fmt"
 	"strings"
-	"time"
 
+	"github.com/charmbracelet/bubbles/help"
 	"github.com/charmbracelet/bubbles/key"
+	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 
 	"github.com/fenggwsx/SlashChat/internal/config"
-	"github.com/fenggwsx/SlashChat/internal/protocol"
 )
 
-// App implements the bubbletea tea.Model interface for the terminal client.
+type activeView int
+
+const (
+	viewHome activeView = iota
+	viewChat
+	viewHelp
+)
+
+// App encapsulates the Bubble Tea TUI state for the GoSlash client.
 type App struct {
-	cfg         config.ClientConfig
-	mode        Mode
-	command     string
-	input       []rune
-	cursor      int
-	messages    []string
-	completed   []string
-	session     *Session
-	token       string
-	userID      string
-	pendingUser string
-	username    string
-	hints       []string
-	viewport    viewport.Model
-	logLine     string
-	view        PrimaryView
-	keys        keyMap
+	cfg config.ClientConfig
+
+	view activeView
+
+	width  int
+	height int
+
+	viewport viewport.Model
+	input    textinput.Model
+	helper   help.Model
+
+	logLine logMessage
+
+	statusOnline bool
+	username     string
+	room         string
+
+	chatHistory []string
+	commands    []commandSpec
+
+	showHelp   bool
+	helpView   string
+	helpHeight int
+
+	serverAddr string
+
+	styles styleSet
 }
 
-// Mode represents the current interaction mode.
-type Mode int
-
-const (
-	// ModeCommand expects slash-prefixed input.
-	ModeCommand Mode = iota
-	// ModeInsert allows free-form message editing.
-	ModeInsert
-)
-
-// PrimaryView enumerates main content panels.
-type PrimaryView int
-
-const (
-	ViewWelcome PrimaryView = iota
-	ViewChat
-	ViewDebug
-)
-
-type keyMap struct {
-	shiftEnter key.Binding
+type commandSpec struct {
+	trigger     string
+	usage       string
+	description string
 }
 
-// NewApp returns a Bubble Tea model pre-populated with defaults.
-func NewApp(cfg config.ClientConfig) tea.Model {
+type logMessage struct {
+	label string
+	body  string
+}
+
+type styleSet struct {
+	title         lipgloss.Style
+	view          lipgloss.Style
+	statusOnline  lipgloss.Style
+	statusOffline lipgloss.Style
+	label         lipgloss.Style
+	value         lipgloss.Style
+	logLabel      lipgloss.Style
+	logBody       lipgloss.Style
+	help          lipgloss.Style
+}
+
+// NewApp constructs the client application model.
+func NewApp(cfg config.ClientConfig) *App {
+	input := textinput.New()
+	input.Prompt = "> "
+	input.Placeholder = "Type a message or start with / for commands"
+	input.CharLimit = 256
+	input.Width = 60
+	input.Focus()
+
 	vp := viewport.New(0, 0)
+	vp.MouseWheelEnabled = true
+	helper := help.New()
+	helper.ShowAll = true
+
 	app := &App{
-		cfg:      cfg,
-		mode:     ModeInsert,
-		view:     ViewWelcome,
-		input:    make([]rune, 0, defaultInputCapacity),
-		messages: make([]string, 0, 128),
+		cfg:        cfg,
+		view:       viewHome,
+		serverAddr: cfg.ServerAddr,
+
 		viewport: vp,
-		keys: keyMap{
-			shiftEnter: key.NewBinding(key.WithKeys("shift+enter")),
-		},
+		input:    input,
+		helper:   helper,
+
+		logLine: logMessage{label: "[msg]", body: "GoSlash client ready"},
+
+		statusOnline: false,
+		username:     "guest",
+		room:         "-",
+
+		chatHistory: []string{},
+		commands:    defaultCommands(),
+
+		styles: buildStyles(),
 	}
-	app.refreshViewport()
+
+	app.updateInputWidth()
+	app.updateViewportContent()
+	app.updateHelp()
+
 	return app
 }
 
-// Init is part of the tea.Model interface.
+// Init satisfies tea.Model.
 func (a *App) Init() tea.Cmd {
-	return nil
+	return textinput.Blink
 }
 
-// Update handles user input and internal events.
+// Update drives the Bubble Tea update loop.
 func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch m := msg.(type) {
 	case tea.WindowSizeMsg:
-		a.resizeViewport(m.Width, m.Height)
+		a.width = m.Width
+		a.height = m.Height
+		a.viewport.Width = a.width
+		a.updateInputWidth()
+		a.updateHelp()
+		a.updateViewportSize()
+		a.updateViewportContent()
 		return a, nil
+
 	case tea.KeyMsg:
-		return a.handleKey(m)
-	case connectResultMsg:
-		return a.handleConnectResult(m)
-	case envelopeMsg:
-		return a.handleEnvelope(m)
-	case sessionClosedMsg:
-		return a.handleSessionClosed(m)
-	case authSendResultMsg:
-		return a.handleAuthResult(m)
-	default:
+		if m.Type == tea.KeyCtrlC {
+			return a, tea.Quit
+		}
+
+		if !a.input.Focused() {
+			a.input.Focus()
+		}
+
+		var cmds []tea.Cmd
+		var cmd tea.Cmd
+
+		a.input, cmd = a.input.Update(m)
+		if cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+
+		if m.Type == tea.KeyEnter {
+			value := strings.TrimSpace(a.input.Value())
+			if value != "" {
+				a.handleSubmit(value)
+			}
+			a.input.SetValue("")
+			a.input.CursorEnd()
+		}
+
+		a.updateHelp()
+		a.updateViewportSize()
+
+		a.viewport, cmd = a.viewport.Update(m)
+		if cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+
+		return a, tea.Batch(cmds...)
+
+	case tea.MouseMsg:
 		var cmd tea.Cmd
 		a.viewport, cmd = a.viewport.Update(m)
 		return a, cmd
 	}
-	return a, nil
+
+	var cmd tea.Cmd
+	a.viewport, cmd = a.viewport.Update(msg)
+	return a, cmd
 }
 
-func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	if key.Matches(msg, a.keys.shiftEnter) && a.mode == ModeInsert {
-		a.insertRune('\n')
-		return a, nil
+// View renders the composed layout.
+func (a *App) View() string {
+	var b strings.Builder
+
+	b.WriteString(a.viewport.View())
+	b.WriteString("\n")
+
+	if a.showHelp && a.helpView != "" {
+		b.WriteString(a.styles.help.Render(a.helpView))
+		b.WriteString("\n")
 	}
 
-	switch msg.Type {
-	case tea.KeyPgUp:
-		a.scrollMessages(a.viewport.Height)
-		return a, nil
-	case tea.KeyPgDown:
-		a.scrollMessages(-a.viewport.Height)
-		return a, nil
-	case tea.KeyUp:
-		if a.mode == ModeInsert {
-			a.moveCursorUp()
-		} else {
-			a.scrollMessages(1)
+	b.WriteString(a.input.View())
+	b.WriteString("\n")
+	b.WriteString(a.logLineView())
+	b.WriteString("\n")
+	b.WriteString(a.statusLine())
+
+	return b.String()
+}
+
+func (a *App) handleSubmit(value string) {
+	if strings.HasPrefix(value, string(a.cfg.CommandPrefix)) {
+		a.executeCommand(value)
+		return
+	}
+
+	a.appendChatMessage(value)
+}
+
+func (a *App) executeCommand(raw string) {
+	fields := strings.Fields(raw)
+	if len(fields) == 0 {
+		return
+	}
+
+	cmd := fields[0]
+	switch cmd {
+	case "/home":
+		a.view = viewHome
+		a.logf("Switched to HOME view")
+	case "/chat":
+		a.view = viewChat
+		a.logf("Switched to CHAT view")
+	case "/help":
+		a.view = viewHelp
+		a.logf("Switched to HELP view")
+	case "/connect":
+		target := a.serverAddr
+		if len(fields) > 1 {
+			target = fields[1]
 		}
-		return a, nil
-	case tea.KeyDown:
-		if a.mode == ModeInsert {
-			a.moveCursorDown()
-		} else {
-			a.scrollMessages(-1)
-		}
-		return a, nil
-	case tea.KeyLeft:
-		a.moveCursorLeft()
-		return a, nil
-	case tea.KeyRight:
-		a.moveCursorRight()
-		return a, nil
-	case tea.KeyHome:
-		a.moveCursorStart()
-		return a, nil
-	case tea.KeyEnd:
-		a.moveCursorEnd()
-		return a, nil
-	case tea.KeyEsc:
-		a.mode = ModeInsert
-		a.command = ""
-		a.hints = nil
-		return a, nil
-	case tea.KeyEnter:
-		return a.handleEnter()
-	case tea.KeyBackspace:
-		a.backspace()
-		return a, nil
-	case tea.KeyDelete:
-		a.deleteForward()
-		return a, nil
-	case tea.KeySpace:
-		if a.mode == ModeCommand {
-			a.captureCommand(" ")
-		} else {
-			a.insertRune(' ')
-		}
-		return a, nil
-	}
-
-	if len(msg.Runes) > 0 {
-		if a.mode == ModeInsert {
-			if len(a.input) == 0 && len(msg.Runes) == 1 && msg.Runes[0] == rune(a.cfg.CommandPrefix) {
-				a.mode = ModeCommand
-				a.command = string(a.cfg.CommandPrefix)
-				a.updateHints()
-				return a, nil
-			}
-			a.insertRunes(msg.Runes)
-			return a, nil
-		}
-		a.captureCommand(string(msg.Runes))
-		return a, nil
-	}
-
-	return a, nil
-}
-
-func (a *App) captureCommand(value string) {
-	if value == "" {
+		a.serverAddr = target
+		a.statusOnline = true
+		a.logf("Connecting to %s (stub)", target)
+	case "/quit":
+		a.logf("Exiting client")
+		a.appendSystemMessage("Session ended. Press Ctrl+C to close.")
 		return
-	}
-	if a.mode != ModeCommand {
-		return
-	}
-	if len(a.command) == 0 {
-		a.command = string(a.cfg.CommandPrefix)
-	}
-	a.command += value
-	a.updateHints()
-}
-
-func (a *App) backspace() {
-	if a.mode == ModeCommand {
-		prefixLen := len(string(a.cfg.CommandPrefix))
-		if len(a.command) > prefixLen {
-			a.command = a.command[:len(a.command)-1]
-			a.updateHints()
-			return
-		}
-		a.mode = ModeInsert
-		a.command = ""
-		a.hints = nil
-		return
-	}
-	if a.cursor == 0 || len(a.input) == 0 {
-		return
-	}
-	a.input = append(a.input[:a.cursor-1], a.input[a.cursor:]...)
-	a.cursor--
-}
-
-func (a *App) handleEnter() (tea.Model, tea.Cmd) {
-	if a.mode == ModeInsert {
-		raw := string(a.input)
-		if strings.TrimSpace(raw) != "" {
-			a.addMessage(raw)
-			a.completed = append(a.completed, raw)
-		}
-		a.clearInput()
-		return a, nil
-	}
-
-	raw := strings.TrimSpace(a.command)
-	a.command = ""
-	a.mode = ModeInsert
-	a.hints = nil
-	if raw == "" {
-		return a, nil
-	}
-
-	a.completed = append(a.completed, raw)
-	return a, a.executeCommand(raw)
-}
-
-func (a *App) insertRune(r rune) {
-	a.insertRunes([]rune{r})
-}
-
-func (a *App) insertRunes(runes []rune) {
-	if len(runes) == 0 {
-		return
-	}
-	insertion := len(runes)
-	currentLen := len(a.input)
-	a.input = append(a.input, make([]rune, insertion)...)
-	copy(a.input[a.cursor+insertion:], a.input[a.cursor:currentLen])
-	copy(a.input[a.cursor:], runes)
-	a.cursor += insertion
-}
-
-func (a *App) deleteForward() {
-	if a.mode == ModeCommand {
-		return
-	}
-	if a.cursor >= len(a.input) {
-		return
-	}
-	a.input = append(a.input[:a.cursor], a.input[a.cursor+1:]...)
-}
-
-func (a *App) moveCursorLeft() {
-	if a.mode != ModeInsert {
-		return
-	}
-	if a.cursor > 0 {
-		a.cursor--
-	}
-}
-
-func (a *App) moveCursorRight() {
-	if a.mode != ModeInsert {
-		return
-	}
-	if a.cursor < len(a.input) {
-		a.cursor++
-	}
-}
-
-func (a *App) moveCursorStart() {
-	if a.mode != ModeInsert {
-		return
-	}
-	a.cursor = 0
-}
-
-func (a *App) moveCursorEnd() {
-	if a.mode != ModeInsert {
-		return
-	}
-	a.cursor = len(a.input)
-}
-
-func (a *App) clearInput() {
-	a.input = a.input[:0]
-	a.cursor = 0
-}
-
-func (a *App) moveCursorUp() {
-	if a.mode != ModeInsert {
-		return
-	}
-	if a.cursor == 0 {
-		return
-	}
-	currentLineStart := lastIndexOfRune(a.input, '\n', a.cursor-1) + 1
-	if currentLineStart == 0 {
-		a.cursor = 0
-		return
-	}
-	prevLineEnd := currentLineStart - 1
-	prevLineStart := lastIndexOfRune(a.input, '\n', prevLineEnd-1) + 1
-	column := a.cursor - currentLineStart
-	prevLineLength := prevLineEnd - prevLineStart
-	if column > prevLineLength {
-		column = prevLineLength
-	}
-	a.cursor = prevLineStart + column
-}
-
-func (a *App) moveCursorDown() {
-	if a.mode != ModeInsert {
-		return
-	}
-	if a.cursor >= len(a.input) {
-		return
-	}
-	currentLineStart := lastIndexOfRune(a.input, '\n', a.cursor-1) + 1
-	nextBreak := indexOfRune(a.input, '\n', a.cursor)
-	if nextBreak == -1 {
-		a.cursor = len(a.input)
-		return
-	}
-	nextLineStart := nextBreak + 1
-	column := a.cursor - currentLineStart
-	nextLineEnd := indexOfRune(a.input, '\n', nextLineStart)
-	if nextLineEnd == -1 {
-		nextLineEnd = len(a.input)
-	}
-	nextLineLength := nextLineEnd - nextLineStart
-	if column > nextLineLength {
-		column = nextLineLength
-	}
-	a.cursor = nextLineStart + column
-}
-
-func lastIndexOfRune(runes []rune, target rune, before int) int {
-	if before >= len(runes) {
-		before = len(runes) - 1
-	}
-	if before < 0 {
-		return -1
-	}
-	for i := before; i >= 0; i-- {
-		if runes[i] == target {
-			return i
-		}
-	}
-	return -1
-}
-
-func indexOfRune(runes []rune, target rune, start int) int {
-	if start < 0 {
-		start = 0
-	}
-	for i := start; i < len(runes); i++ {
-		if runes[i] == target {
-			return i
-		}
-	}
-	return -1
-}
-
-func (a *App) executeCommand(raw string) tea.Cmd {
-	a.log("command: %s", raw)
-
-	prefix := string(a.cfg.CommandPrefix)
-	if !strings.HasPrefix(raw, prefix) {
-		a.log("commands must start with %s", prefix)
-		return nil
-	}
-
-	content := strings.TrimSpace(raw[len(prefix):])
-	if content == "" {
-		a.log("missing command name")
-		return nil
-	}
-
-	parts := strings.Fields(content)
-	name := strings.ToLower(parts[0])
-	args := parts[1:]
-
-	switch name {
-	case "connect":
-		return a.commandConnect(args)
-	case "welcome":
-		a.setView(ViewWelcome)
-		return nil
-	case "chat":
-		a.setView(ViewChat)
-		return nil
-	case "debug":
-		a.setView(ViewDebug)
-		return nil
-	case "register":
-		return a.commandRegister(args)
-	case "login":
-		return a.commandLogin(args)
-	case "quit", "exit":
-		return a.commandQuit()
 	default:
-		a.log("unknown command: %s", name)
-		return nil
+		a.logf("Command %s not implemented", cmd)
 	}
+
+	a.updateViewportContent()
 }
 
-func (a *App) commandConnect(args []string) tea.Cmd {
-	if a.session != nil {
-		a.log("already connected")
-		return nil
-	}
-
-	address := a.cfg.ServerAddr
-	if len(args) > 0 {
-		address = args[0]
-	}
-	if address == "" {
-		a.log("no server address configured")
-		return nil
-	}
-
-	a.log("connecting to %s ...", address)
-	a.cfg.ServerAddr = address
-	return connectCommand(a.cfg, address)
-}
-
-func (a *App) commandRegister(args []string) tea.Cmd {
-	if !a.ensureConnected() {
-		return nil
-	}
-	if len(args) < 2 {
-		a.log("usage: /register <username> <password>")
-		return nil
-	}
-	username := args[0]
-	password := args[1]
-	a.log("registering as %s...", username)
-	a.pendingUser = username
-	return tea.Batch(
-		a.sendAuthRequest("register", username, password),
-	)
-}
-
-func (a *App) commandLogin(args []string) tea.Cmd {
-	if !a.ensureConnected() {
-		return nil
-	}
-	if len(args) < 2 {
-		a.log("usage: /login <username> <password>")
-		return nil
-	}
-	username := args[0]
-	password := args[1]
-	a.log("logging in as %s...", username)
-	a.pendingUser = username
-	return tea.Batch(
-		a.sendAuthRequest("login", username, password),
-	)
-}
-
-func (a *App) updateHints() {
-	if a.mode != ModeCommand {
-		a.hints = nil
+func (a *App) appendSystemMessage(text string) {
+	text = strings.TrimSpace(text)
+	if text == "" {
 		return
 	}
-	prefix := string(a.cfg.CommandPrefix)
-	if !strings.HasPrefix(a.command, prefix) {
-		a.hints = nil
-		return
-	}
-	typed := strings.TrimSpace(strings.TrimPrefix(a.command, prefix))
-	var search string
-	if typed != "" {
-		parts := strings.Fields(typed)
-		if len(parts) > 0 {
-			search = strings.ToLower(parts[0])
-		}
-	}
-	suggestions := make([]string, 0, maxCommandHints)
-	for _, spec := range commandCatalog {
-		if search == "" || strings.HasPrefix(spec.Name, search) {
-			suggestions = append(suggestions, fmt.Sprintf("%s — %s", spec.Usage, spec.Description))
-			if len(suggestions) >= maxCommandHints {
-				break
-			}
-		}
-	}
-	a.hints = suggestions
-}
-
-func (a *App) ensureConnected() bool {
-	if a.session == nil {
-		a.log("not connected; use /connect first")
-		return false
-	}
-	return true
-}
-
-func (a *App) sendAuthRequest(action, username, password string) tea.Cmd {
-	session := a.session
-	if session == nil {
-		return nil
-	}
-	env := protocol.Envelope{
-		Type: protocol.MessageTypeAuthRequest,
-		Payload: protocol.AuthRequest{
-			Action:   action,
-			Username: username,
-			Password: password,
-		},
-	}
-	return func() tea.Msg {
-		ctx, cancel := context.WithTimeout(context.Background(), authRequestTimeout)
-		defer cancel()
-		if err := session.Send(ctx, env); err != nil {
-			return authSendResultMsg{Username: username, Err: err}
-		}
-		return authSendResultMsg{Username: username}
-	}
-}
-
-func (a *App) commandQuit() tea.Cmd {
-	a.log("closing client")
-	if a.session != nil {
-		_ = a.session.Close()
-		a.session = nil
-	}
-	a.token = ""
-	a.userID = ""
-	a.pendingUser = ""
-	a.username = ""
-	a.mode = ModeInsert
-	a.hints = nil
-	a.clearInput()
-	return tea.Quit
-}
-
-func (a *App) handleConnectResult(msg connectResultMsg) (tea.Model, tea.Cmd) {
-	if msg.Err != nil {
-		a.log("connection failed: %v", msg.Err)
-		return a, nil
-	}
-
-	if a.session != nil {
-		_ = a.session.Close()
-	}
-
-	a.session = msg.Session
-	a.log("connected to %s", msg.Address)
-	a.token = ""
-	a.userID = ""
-	a.pendingUser = ""
-	a.username = ""
-	return a, listenForMessages(a.session)
-}
-
-func (a *App) handleEnvelope(msg envelopeMsg) (tea.Model, tea.Cmd) {
-	if msg.Session != a.session || a.session == nil {
-		return a, nil
-	}
-	if err := a.processEnvelope(msg.Envelope); err != nil {
-		a.log("message error: %v", err)
-	}
-	return a, listenForMessages(a.session)
-}
-
-func (a *App) handleSessionClosed(msg sessionClosedMsg) (tea.Model, tea.Cmd) {
-	if msg.Session != a.session || a.session == nil {
-		return a, nil
-	}
-	a.session = nil
-	a.token = ""
-	a.userID = ""
-	a.pendingUser = ""
-	a.username = ""
-	a.log("connection closed")
-	return a, nil
-}
-
-func (a *App) handleAuthResult(msg authSendResultMsg) (tea.Model, tea.Cmd) {
-	if msg.Err != nil {
-		a.log("auth request failed: %v", msg.Err)
-		if a.pendingUser == msg.Username {
-			a.pendingUser = ""
-		}
-	}
-	return a, nil
-}
-
-func (a *App) processEnvelope(env protocol.Envelope) error {
-	switch env.Type {
-	case protocol.MessageTypeAck:
-		ack, err := decodeAckPayload(env.Payload)
-		if err != nil {
-			return err
-		}
-		status := strings.ToLower(ack.Status)
-		if ack.Reason != "" {
-			a.log("ack[%s]: %s", status, ack.Reason)
-		} else {
-			a.log("ack[%s]", status)
-		}
-		if status == ackStatusError {
-			a.pendingUser = ""
-		}
-	case protocol.MessageTypeAuthResponse:
-		resp, err := decodeAuthResponse(env.Payload)
-		if err != nil {
-			return err
-		}
-		a.token = resp.Token
-		a.userID = resp.UserID
-		username := a.pendingUser
-		if username == "" {
-			username = a.username
-		}
-		expires := time.Unix(resp.ExpiresAt, 0).Format(time.RFC3339)
-		a.log("authenticated as %s (user id: %s, expires: %s)", username, resp.UserID, expires)
-		a.pendingUser = ""
-		if username != "" {
-			a.username = username
-		}
-	default:
-		a.log("received envelope type %s", env.Type)
-	}
-	return nil
-}
-
-func (a *App) log(format string, args ...interface{}) {
-	a.logLine = fmt.Sprintf(format, args...)
-}
-
-func (a *App) addMessage(message string) {
-	a.messages = append(a.messages, message)
-	a.refreshViewport()
-}
-
-func (a *App) setView(view PrimaryView) {
-	if a.view == view {
-		return
-	}
-	a.view = view
-	switch view {
-	case ViewWelcome:
-		a.log("switched to welcome view")
-	case ViewChat:
-		a.log("switched to chat view")
-		a.refreshViewport()
-	case ViewDebug:
-		a.log("switched to debug view")
-	}
-}
-
-func (a *App) refreshViewport() {
-	content := strings.Join(a.messages, "\n")
-	atBottom := a.viewport.AtBottom()
-	a.viewport.SetContent(content)
-	if atBottom {
+	message := fmt.Sprintf("[system] %s", text)
+	a.chatHistory = append(a.chatHistory, message)
+	if a.view == viewChat {
+		a.updateViewportContent()
 		a.viewport.GotoBottom()
 	}
 }
 
-func (a *App) scrollMessages(lines int) {
-	if a.view != ViewChat || lines == 0 {
+func (a *App) appendChatMessage(text string) {
+	text = strings.TrimSpace(text)
+	if text == "" {
 		return
 	}
-	if lines > 0 {
-		a.viewport.LineUp(lines)
-	} else {
-		a.viewport.LineDown(-lines)
+
+	message := fmt.Sprintf("%s: %s", a.username, text)
+	a.chatHistory = append(a.chatHistory, message)
+	a.logf("Appended message to chat view")
+
+	if a.view == viewChat {
+		a.updateViewportContent()
+		a.viewport.GotoBottom()
 	}
 }
 
-func (a *App) resizeViewport(width, height int) {
-	if width <= 0 || height <= 0 {
-		return
-	}
-	const reservedLines = 7
-	viewportHeight := height - reservedLines
-	if viewportHeight < 3 {
-		viewportHeight = 3
-	}
-	a.viewport.Width = width
-	a.viewport.Height = viewportHeight
-	a.refreshViewport()
-}
-
-// View renders the terminal UI.
-func (a *App) View() string {
-	var b strings.Builder
-	if primary := a.renderPrimaryContent(); primary != "" {
-		b.WriteString(primary)
-		b.WriteString("\n")
-	}
-	if hintLines := a.renderCommandHints(); len(hintLines) > 0 {
-		b.WriteString(separator())
-		b.WriteString("\n")
-		for _, line := range hintLines {
-			b.WriteString(line)
-			b.WriteString("\n")
-		}
-	}
-	b.WriteString(separator())
-	b.WriteString("\n")
-	b.WriteString(a.renderInputLine())
-	b.WriteString("\n")
-	b.WriteString(separator())
-	b.WriteString("\n")
-	if a.logLine != "" {
-		b.WriteString(a.logLine)
-	} else {
-		b.WriteString(" ")
-	}
-	b.WriteString("\n")
-	b.WriteString(separator())
-	b.WriteString("\n")
-	b.WriteString(a.renderStatusBar())
-	return b.String()
-}
-
-func separator() string {
-	return strings.Repeat("-", 60)
-}
-
-func (a *App) renderPrimaryContent() string {
+func (a *App) updateViewportContent() {
 	switch a.view {
-	case ViewWelcome:
-		return a.renderWelcomeView()
-	case ViewDebug:
-		return a.renderDebugView()
-	case ViewChat:
-		fallthrough
-	default:
-		return a.viewport.View()
-	}
-}
-
-func (a *App) renderWelcomeView() string {
-	lines := []string{
-		"GoSlash :: Welcome",
-		"",
-		"/connect <addr>   connect to a server",
-		"/register u p     create a new account",
-		"/login u p        authenticate",
-		"/chat | /welcome | /debug switch views",
-	}
-	return strings.Join(lines, "\n")
-}
-
-func (a *App) renderDebugView() string {
-	lines := []string{
-		"GoSlash :: Debug",
-		fmt.Sprintf("Mode: %s", modeLabel(a.mode)),
-		fmt.Sprintf("View: %s", viewLabel(a.view)),
-		fmt.Sprintf("Messages: %d", len(a.messages)),
-		fmt.Sprintf("Cursor: %d/%d", a.cursor, len(a.input)),
-		fmt.Sprintf("Session active: %t", a.session != nil),
-		fmt.Sprintf("Pending user: %s", a.pendingUser),
-	}
-	return strings.Join(lines, "\n")
-}
-
-func (a *App) renderStatusBar() string {
-	mode := modeLabel(a.mode)
-	status := "offline"
-	server := "-"
-	if a.session != nil {
-		status = "connected"
-		if addr := a.session.cfg.ServerAddr; addr != "" {
-			server = addr
+	case viewHome:
+		a.viewport.SetContent(homeContent)
+	case viewChat:
+		if len(a.chatHistory) == 0 {
+			a.viewport.SetContent("No chat messages yet. Type and press Enter to send.")
+		} else {
+			a.viewport.SetContent(strings.Join(a.chatHistory, "\n"))
 		}
-	} else if a.cfg.ServerAddr != "" {
-		server = a.cfg.ServerAddr
-	}
-	user := "-"
-	switch {
-	case a.pendingUser != "":
-		user = a.pendingUser + "*"
-	case a.username != "":
-		user = a.username
-	case a.token != "":
-		user = "authenticated"
-	}
-	room := "-"
-	return fmt.Sprintf("GoSlash | Mode:%s | View:%s | Status:%s | Server:%s | User:%s | Room:%s", mode, viewLabel(a.view), status, server, user, room)
-}
-
-func (a *App) renderCommandHints() []string {
-	if a.mode != ModeCommand || len(a.hints) == 0 {
-		return nil
-	}
-	lines := make([]string, 0, len(a.hints)+1)
-	lines = append(lines, "Hints:")
-	for _, hint := range a.hints {
-		lines = append(lines, "  "+hint)
-	}
-	return lines
-}
-
-func (a *App) renderInputLine() string {
-	if a.mode == ModeCommand {
-		return a.command + cursorIndicator
-	}
-	before := string(a.input[:a.cursor])
-	after := string(a.input[a.cursor:])
-	return before + cursorIndicator + after
-}
-
-func modeLabel(mode Mode) string {
-	switch mode {
-	case ModeCommand:
-		return "COMMAND"
-	case ModeInsert:
-		return "INSERT"
-	default:
-		return "UNKNOWN"
+		a.viewport.GotoBottom()
+	case viewHelp:
+		a.viewport.SetContent(a.renderHelpView())
 	}
 }
 
-func viewLabel(view PrimaryView) string {
-	switch view {
-	case ViewWelcome:
-		return "WELCOME"
-	case ViewChat:
-		return "CHAT"
-	case ViewDebug:
-		return "DEBUG"
-	default:
-		return "UNKNOWN"
+func (a *App) updateViewportSize() {
+	if a.height == 0 {
+		return
 	}
+	const fixed = 3 // input + log + status
+	height := a.height - fixed - a.helpHeight
+	if height < 3 {
+		height = 3
+	}
+	a.viewport.Height = height
+	a.viewport.Width = a.width
 }
 
-type connectResultMsg struct {
-	Address string
-	Session *Session
-	Err     error
+func (a *App) updateInputWidth() {
+	width := a.width
+	if width <= 0 {
+		width = 60
+	}
+	promptWidth := lipgloss.Width(a.input.Prompt)
+	usable := width - promptWidth - 1
+	if usable < 10 {
+		usable = 10
+	}
+	a.input.Width = usable
 }
 
-type envelopeMsg struct {
-	Session  *Session
-	Envelope protocol.Envelope
+func (a *App) updateHelp() {
+	value := a.input.Value()
+	if value == "" || !strings.HasPrefix(value, string(a.cfg.CommandPrefix)) {
+		a.showHelp = false
+		a.helpView = ""
+		a.helpHeight = 0
+		return
+	}
+
+	token := value
+	if idx := strings.IndexAny(value, " \t"); idx >= 0 {
+		token = value[:idx]
+	}
+
+	bindings := a.matchingBindings(token)
+	if len(bindings) == 0 {
+		a.showHelp = false
+		a.helpView = ""
+		a.helpHeight = 0
+		return
+	}
+
+	a.showHelp = true
+	a.helper.Width = a.width
+	view := a.helper.View(dynamicKeyMap{keys: bindings})
+	view = strings.TrimRight(view, "\n")
+	a.helpView = view
+	a.helpHeight = countLines(view)
 }
 
-type sessionClosedMsg struct {
-	Session *Session
-}
-
-type authSendResultMsg struct {
-	Username string
-	Err      error
-}
-
-const (
-	connectTimeout       = 5 * time.Second
-	authRequestTimeout   = 5 * time.Second
-	maxCommandHints      = 5
-	cursorIndicator      = "|"
-	defaultInputCapacity = 256
-)
-
-const ackStatusError = "error"
-
-type commandSpec struct {
-	Name        string
-	Usage       string
-	Description string
-}
-
-var commandCatalog = []commandSpec{
-	{
-		Name:        "connect",
-		Usage:       "/connect [address]",
-		Description: "Connect to a GoSlash server",
-	},
-	{
-		Name:        "welcome",
-		Usage:       "/welcome",
-		Description: "Switch to the welcome view",
-	},
-	{
-		Name:        "chat",
-		Usage:       "/chat",
-		Description: "Show chat history",
-	},
-	{
-		Name:        "debug",
-		Usage:       "/debug",
-		Description: "Show debug information",
-	},
-	{
-		Name:        "register",
-		Usage:       "/register <username> <password>",
-		Description: "Create a new account on the server",
-	},
-	{
-		Name:        "login",
-		Usage:       "/login <username> <password>",
-		Description: "Authenticate with an existing account",
-	},
-	{
-		Name:        "quit",
-		Usage:       "/quit",
-		Description: "Exit the GoSlash client (alias: /exit)",
-	},
-}
-
-func connectCommand(cfg config.ClientConfig, address string) tea.Cmd {
-	return func() tea.Msg {
-		sessionCfg := cfg
-		sessionCfg.ServerAddr = address
-		session := NewSession(sessionCfg)
-
-		ctx, cancel := context.WithTimeout(context.Background(), connectTimeout)
-		defer cancel()
-
-		if err := session.Connect(ctx); err != nil {
-			_ = session.Close()
-			return connectResultMsg{Address: address, Err: err}
+func (a *App) matchingBindings(prefix string) []key.Binding {
+	prefix = strings.ToLower(prefix)
+	var bindings []key.Binding
+	for _, c := range a.commands {
+		if strings.HasPrefix(strings.ToLower(c.trigger), prefix) {
+			bindings = append(bindings, key.NewBinding(
+				key.WithKeys(c.usage),
+				key.WithHelp(c.usage, c.description),
+			))
 		}
+	}
+	return bindings
+}
 
-		return connectResultMsg{Address: address, Session: session}
+func (a *App) statusLine() string {
+	status := "OFFLINE"
+	if a.statusOnline {
+		status = "ONLINE"
+	}
+
+	parts := []string{
+		a.styles.title.Render("GoSlash"),
+		a.styles.view.Render(strings.ToUpper(a.view.String())),
+		a.statusValueStyle(status).Render(status),
+		a.styles.label.Render("Server") + ": " + a.styles.value.Render(a.serverAddr),
+		a.styles.label.Render("User") + ": " + a.styles.value.Render(a.username),
+		a.styles.label.Render("Room") + ": " + a.styles.value.Render(a.room),
+	}
+
+	return strings.Join(parts, " | ")
+}
+
+func (a *App) logf(format string, args ...any) {
+	a.logLine = logMessage{
+		label: "[msg]",
+		body:  fmt.Sprintf(format, args...),
 	}
 }
 
-func listenForMessages(session *Session) tea.Cmd {
-	if session == nil {
-		return nil
-	}
-	ch := session.Messages()
-	return func() tea.Msg {
-		env, ok := <-ch
-		if !ok {
-			return sessionClosedMsg{Session: session}
-		}
-		return envelopeMsg{Session: session, Envelope: env}
+func defaultCommands() []commandSpec {
+	return []commandSpec{
+		{trigger: "/connect", usage: "/connect [addr]", description: "Connect to the server"},
+		{trigger: "/home", usage: "/home", description: "Switch to home view"},
+		{trigger: "/chat", usage: "/chat", description: "Switch to chat view"},
+		{trigger: "/help", usage: "/help", description: "Show command help"},
+		{trigger: "/join", usage: "/join <room>", description: "Join a room"},
+		{trigger: "/leave", usage: "/leave", description: "Leave current room"},
+		{trigger: "/upload", usage: "/upload <path>", description: "Upload a file"},
+		{trigger: "/download", usage: "/download <file>", description: "Download a file"},
+		{trigger: "/quit", usage: "/quit", description: "Exit the client"},
 	}
 }
 
-func decodeAckPayload(payload interface{}) (protocol.AckPayload, error) {
-	var ack protocol.AckPayload
-	data, err := json.Marshal(payload)
-	if err != nil {
-		return ack, err
+func (v activeView) String() string {
+	switch v {
+	case viewHome:
+		return "home"
+	case viewChat:
+		return "chat"
+	case viewHelp:
+		return "help"
+	default:
+		return "unknown"
 	}
-	if err := json.Unmarshal(data, &ack); err != nil {
-		return ack, err
-	}
-	return ack, nil
 }
 
-func decodeAuthResponse(payload interface{}) (protocol.AuthResponse, error) {
-	var resp protocol.AuthResponse
-	data, err := json.Marshal(payload)
-	if err != nil {
-		return resp, err
+type dynamicKeyMap struct {
+	keys []key.Binding
+}
+
+func (d dynamicKeyMap) ShortHelp() []key.Binding {
+	return d.keys
+}
+
+func (d dynamicKeyMap) FullHelp() [][]key.Binding {
+	if len(d.keys) == 0 {
+		return [][]key.Binding{}
 	}
-	if err := json.Unmarshal(data, &resp); err != nil {
-		return resp, err
+	return [][]key.Binding{d.keys}
+}
+
+func countLines(s string) int {
+	if s == "" {
+		return 0
 	}
-	return resp, nil
+	return strings.Count(s, "\n") + 1
+}
+
+const homeContent = "SlashChat\n\nUse /connect to reach the server.\nUse /help to browse all commands."
+
+func (a *App) renderHelpView() string {
+	var b strings.Builder
+	b.WriteString("SlashChat Commands\n\n")
+	for _, c := range a.commands {
+		b.WriteString(fmt.Sprintf("%-18s %s\n", c.usage, c.description))
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+func buildStyles() styleSet {
+	base := lipgloss.NewStyle()
+	return styleSet{
+		title:         base.Foreground(lipgloss.Color("#7D56F9")).Bold(true),
+		view:          base.Foreground(lipgloss.Color("#39B5E0")).Bold(true),
+		statusOnline:  base.Foreground(lipgloss.Color("#31C48D")).Bold(true),
+		statusOffline: base.Foreground(lipgloss.Color("#F87373")).Bold(true),
+		label:         base.Foreground(lipgloss.Color("#9399B2")),
+		value:         base.Foreground(lipgloss.Color("#E5E7EB")),
+		logLabel:      base.Foreground(lipgloss.Color("#C792EA")).Bold(true),
+		logBody:       base.Foreground(lipgloss.Color("#DADFE1")),
+		help:          base.Foreground(lipgloss.Color("#94A3B8")),
+	}
+}
+
+func (a *App) statusValueStyle(status string) lipgloss.Style {
+	if strings.EqualFold(status, "ONLINE") {
+		return a.styles.statusOnline
+	}
+	return a.styles.statusOffline
+}
+
+func (a *App) logLineView() string {
+	return a.styles.logLabel.Render(a.logLine.label) + " " + a.styles.logBody.Render(a.logLine.body)
 }
