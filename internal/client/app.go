@@ -26,8 +26,7 @@ import (
 type activeView int
 
 const (
-	viewHome activeView = iota
-	viewChat
+	viewChat activeView = iota
 	viewHelp
 )
 
@@ -141,7 +140,7 @@ func NewApp(cfg config.ClientConfig) *App {
 
 	app := &App{
 		cfg:        cfg,
-		view:       viewHome,
+		view:       viewChat,
 		serverAddr: cfg.ServerAddr,
 
 		viewport: vp,
@@ -326,9 +325,6 @@ func (a *App) executeCommand(raw string) tea.Cmd {
 	var cmds []tea.Cmd
 
 	switch cmd {
-	case "/home":
-		a.view = viewHome
-		a.logf("Switched to HOME view")
 	case "/chat":
 		a.view = viewChat
 		a.logf("Switched to CHAT view")
@@ -997,9 +993,11 @@ func (a *App) renderMessageBody(msg protocol.ChatMessage) string {
 
 func (a *App) updateViewportContent() {
 	switch a.view {
-	case viewHome:
-		a.viewport.SetContent(homeContent)
 	case viewChat:
+		if !a.hasActiveRoom() {
+			a.viewport.SetContent(homeContent)
+			return
+		}
 		if len(a.chatHistory) == 0 {
 			a.viewport.SetContent("No chat messages yet. Type and press Enter to send.")
 		} else {
@@ -1009,6 +1007,11 @@ func (a *App) updateViewportContent() {
 	case viewHelp:
 		a.viewport.SetContent(a.renderHelpView())
 	}
+}
+
+func (a *App) hasActiveRoom() bool {
+	room := strings.TrimSpace(a.room)
+	return room != "" && room != "-"
 }
 
 func (a *App) updateViewportSize() {
@@ -1111,7 +1114,6 @@ func defaultCommands() []commandSpec {
 		{trigger: "/connect", usage: "/connect [addr]", description: "Connect to the server"},
 		{trigger: "/register", usage: "/register <username> <password>", description: "Register a new account"},
 		{trigger: "/login", usage: "/login <username> <password>", description: "Authenticate with existing credentials"},
-		{trigger: "/home", usage: "/home", description: "Switch to home view"},
 		{trigger: "/chat", usage: "/chat", description: "Switch to chat view"},
 		{trigger: "/help", usage: "/help", description: "Show command help"},
 		{trigger: "/join", usage: "/join <room>", description: "Join a room"},
@@ -1124,8 +1126,6 @@ func defaultCommands() []commandSpec {
 
 func (v activeView) String() string {
 	switch v {
-	case viewHome:
-		return "home"
 	case viewChat:
 		return "chat"
 	case viewHelp:
