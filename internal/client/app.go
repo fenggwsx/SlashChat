@@ -79,6 +79,7 @@ type logMessage struct {
 type pendingRequest struct {
 	action   string
 	username string
+	room     string
 }
 
 type connectResultMsg struct {
@@ -248,7 +249,6 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		a.statusOnline = false
 		a.authToken = ""
 		a.logf("Disconnected from %s", a.serverAddr)
-		a.appendSystemMessage("Disconnected from server")
 		a.session = nil
 		return a, nil
 
@@ -301,8 +301,7 @@ func (a *App) handleSubmit(value string) tea.Cmd {
 		return a.executeCommand(value)
 	}
 
-	a.appendChatMessage(value)
-	return nil
+	return a.sendChatMessage(value)
 }
 
 func (a *App) executeCommand(raw string) tea.Cmd {
@@ -324,6 +323,41 @@ func (a *App) executeCommand(raw string) tea.Cmd {
 	case "/help":
 		a.view = viewHelp
 		a.logf("Switched to HELP view")
+	case "/join":
+		if len(fields) < 2 {
+			a.logf("Usage: /join <room>")
+			break
+		}
+		if !a.isConnected() {
+			a.logf("Not connected. Use /connect first.")
+			break
+		}
+		room := fields[1]
+		if strings.EqualFold(strings.TrimSpace(room), strings.TrimSpace(a.room)) {
+			a.logf("Already in room %s", room)
+			break
+		}
+		a.logf("Joining room %s ...", room)
+		if joinCmd := a.sendJoinCommand(room); joinCmd != nil {
+			cmds = append(cmds, joinCmd)
+		}
+	case "/leave":
+		if !a.isConnected() {
+			a.logf("Not connected. Use /connect first.")
+			break
+		}
+		targetRoom := strings.TrimSpace(a.room)
+		if len(fields) > 1 {
+			targetRoom = fields[1]
+		}
+		if targetRoom == "" || targetRoom == "-" {
+			a.logf("No active room to leave")
+			break
+		}
+		a.logf("Leaving room %s ...", targetRoom)
+		if leaveCmd := a.sendLeaveCommand(targetRoom); leaveCmd != nil {
+			cmds = append(cmds, leaveCmd)
+		}
 	case "/connect":
 		target := a.serverAddr
 		if len(fields) > 1 {
@@ -376,7 +410,6 @@ func (a *App) executeCommand(raw string) tea.Cmd {
 		}
 	case "/quit":
 		a.logf("Exiting client")
-		a.appendSystemMessage("Session ended. Press Ctrl+C to close.")
 		if a.session != nil {
 			_ = a.session.Close()
 			a.session = nil
@@ -470,6 +503,100 @@ func (a *App) sendAuthCommand(action, username, password string) tea.Cmd {
 	return a.sendEnvelope(session, env, fmt.Sprintf("%s request", action), false)
 }
 
+func (a *App) sendJoinCommand(room string) tea.Cmd {
+	session := a.session
+	if session == nil {
+		return nil
+	}
+	room = strings.TrimSpace(room)
+	if room == "" {
+		return nil
+	}
+	if a.pendingRequests == nil {
+		a.pendingRequests = make(map[string]pendingRequest)
+	}
+	requestID := uuid.NewString()
+	a.pendingRequests[requestID] = pendingRequest{action: "join", room: room}
+
+	env := protocol.Envelope{
+		ID:   requestID,
+		Type: protocol.MessageTypeCommand,
+		Metadata: map[string]interface{}{
+			"action": "join",
+			"room":   room,
+		},
+		Payload: protocol.JoinRequest{Room: room},
+	}
+
+	return a.sendEnvelope(session, env, fmt.Sprintf("join %s", room), true)
+}
+
+func (a *App) sendLeaveCommand(room string) tea.Cmd {
+	session := a.session
+	if session == nil {
+		return nil
+	}
+	room = strings.TrimSpace(room)
+	if room == "" {
+		return nil
+	}
+	if a.pendingRequests == nil {
+		a.pendingRequests = make(map[string]pendingRequest)
+	}
+	requestID := uuid.NewString()
+	a.pendingRequests[requestID] = pendingRequest{action: "leave", room: room}
+
+	env := protocol.Envelope{
+		ID:   requestID,
+		Type: protocol.MessageTypeCommand,
+		Metadata: map[string]interface{}{
+			"action": "leave",
+			"room":   room,
+		},
+		Payload: protocol.LeaveRequest{Room: room},
+	}
+
+	return a.sendEnvelope(session, env, fmt.Sprintf("leave %s", room), true)
+}
+
+func (a *App) sendChatMessage(content string) tea.Cmd {
+	content = strings.TrimSpace(content)
+	if content == "" {
+		return nil
+	}
+	if !a.isConnected() {
+		a.logf("Not connected. Use /connect first.")
+		return nil
+	}
+	room := strings.TrimSpace(a.room)
+	if room == "" || room == "-" {
+		a.logf("Join a room before chatting (use /join <room>)")
+		return nil
+	}
+	session := a.session
+	if session == nil {
+		return nil
+	}
+	if a.pendingRequests == nil {
+		a.pendingRequests = make(map[string]pendingRequest)
+	}
+	requestID := uuid.NewString()
+	a.pendingRequests[requestID] = pendingRequest{action: "chat_send", room: room}
+	a.logf("Sending message to %s ...", room)
+
+	env := protocol.Envelope{
+		ID:   requestID,
+		Type: protocol.MessageTypeEvent,
+		Metadata: map[string]interface{}{
+			"action": "chat_send",
+			"room":   room,
+		},
+		Payload: protocol.ChatSendRequest{Room: room, Content: content},
+	}
+
+	return a.sendEnvelope(session, env, "chat message", true)
+}
+
 func (a *App) sendEnvelope(session *Session, env protocol.Envelope, description string, attachToken bool) tea.Cmd {
 	if env.ID == "" {
 		env.ID = uuid.NewString()
@@ -498,6 +625,8 @@ func (a *App) handleSessionEnvelope(env protocol.Envelope) {
 		a.handleAckEnvelope(env)
 	case protocol.MessageTypeAuthResponse:
 		a.handleAuthResponse(env)
+	case protocol.MessageTypeEvent:
+		a.handleEventEnvelope(env)
 	default:
 		a.logf("Received %s message", string(env.Type))
 	}
@@ -528,6 +657,17 @@ func (a *App) handleAckEnvelope(env protocol.Envelope) {
 			a.logf("Registration accepted for %s", pending.username)
 		case "login":
 			a.logf("Login accepted for %s", pending.username)
+		case "join":
+			a.logf("Joined room %s", pending.room)
+		case "leave":
+			a.logf("Left room %s", pending.room)
+			if strings.EqualFold(strings.TrimSpace(a.room), strings.TrimSpace(pending.room)) {
+				a.room = "-"
+				a.chatHistory = nil
+				a.updateViewportContent()
+			}
+		case "chat_send":
+			a.logf("Message delivered to %s", pending.room)
 		default:
 			a.logf("Command %s acknowledged", pending.action)
 		}
@@ -547,6 +687,12 @@ func (a *App) handleAckEnvelope(env protocol.Envelope) {
 		a.logf("Registration failed: %s", reason)
 	case "login":
 		a.logf("Login failed: %s", reason)
+	case "join":
+		a.logf("Join failed: %s", reason)
+	case "leave":
+		a.logf("Leave failed: %s", reason)
+	case "chat_send":
+		a.logf("Message failed: %s", reason)
 	default:
 		a.logf("Command %s failed: %s", pending.action, reason)
 	}
@@ -575,42 +721,89 @@ func (a *App) handleAuthResponse(env protocol.Envelope) {
 	}
 
 	a.logf(message)
-	a.appendSystemMessage(message)
 	a.lastAuthAction = ""
 	a.lastAuthUser = ""
+}
+
+func (a *App) handleEventEnvelope(env protocol.Envelope) {
+	action := strings.ToLower(metadataString(env.Metadata, "action"))
+	switch action {
+	case "chat_history":
+		a.handleChatHistory(env)
+	case "chat_message":
+		a.handleChatMessage(env)
+	default:
+		a.logf("Unhandled event action: %s", action)
+	}
 }
 
 func (a *App) isConnected() bool {
 	return a.session != nil && a.statusOnline
 }
 
-func (a *App) appendSystemMessage(text string) {
-	text = strings.TrimSpace(text)
-	if text == "" {
+func (a *App) handleChatHistory(env protocol.Envelope) {
+	history, err := decodeChatHistory(env.Payload)
+	if err != nil {
+		a.logf("Failed to decode chat history: %v", err)
 		return
 	}
-	message := fmt.Sprintf("[system] %s", text)
-	a.chatHistory = append(a.chatHistory, message)
+	r := strings.TrimSpace(history.Room)
+	if r == "" {
+		a.logf("Received chat history without room")
+		return
+	}
+	a.room = r
+	a.chatHistory = make([]string, 0, len(history.Messages))
+	for _, msg := range history.Messages {
+		a.chatHistory = append(a.chatHistory, a.formatChatMessage(msg))
+	}
+	a.updateViewportContent()
+	if a.view == viewChat {
+		a.viewport.GotoBottom()
+	}
+	a.logf("Loaded %d messages for %s", len(history.Messages), r)
+}
+
+func (a *App) handleChatMessage(env protocol.Envelope) {
+	msg, err := decodeChatMessage(env.Payload)
+	if err != nil {
+		a.logf("Failed to decode chat message: %v", err)
+		return
+	}
+	room := strings.TrimSpace(msg.Room)
+	if room == "" {
+		return
+	}
+	if !strings.EqualFold(strings.TrimSpace(a.room), room) {
+		// Message for another room; future enhancement could queue it.
+		return
+	}
+	a.appendChatLine(a.formatChatMessage(msg))
+}
+
+func (a *App) appendChatLine(line string) {
+	line = strings.TrimSpace(line)
+	if line == "" {
+		return
+	}
+	a.chatHistory = append(a.chatHistory, line)
 	if a.view == viewChat {
 		a.updateViewportContent()
 		a.viewport.GotoBottom()
 	}
 }
 
-func (a *App) appendChatMessage(text string) {
-	text = strings.TrimSpace(text)
-	if text == "" {
-		return
+func (a *App) formatChatMessage(msg protocol.ChatMessage) string {
+	content := strings.TrimSpace(msg.Content)
+	username := strings.TrimSpace(msg.Username)
+	timestamp := ""
+	if msg.CreatedAt > 0 {
+		timestamp = time.Unix(msg.CreatedAt, 0).Local().Format("15:04:05")
 	}
-
-	message := fmt.Sprintf("%s: %s", a.username, text)
-	a.chatHistory = append(a.chatHistory, message)
-	a.logf("Appended message to chat view")
-
-	if a.view == viewChat {
-		a.updateViewportContent()
-		a.viewport.GotoBottom()
+	if timestamp != "" {
+		return fmt.Sprintf("[%s] %s: %s", timestamp, username, content)
 	}
+	return fmt.Sprintf("%s: %s", username, content)
 }
 
 func (a *App) updateViewportContent() {
@@ -775,7 +968,7 @@ func countLines(s string) int {
 	return strings.Count(s, "\n") + 1
 }
 
-const homeContent = "SlashChat\n\nUse /connect to reach the server.\nUse /register or /login after connecting.\nUse /help to browse all commands."
+const homeContent = "SlashChat\n\nUse /connect to reach the server.\nUse /register or /login after connecting.\nUse /join <room> to load chat history.\nUse /help to browse all commands."
 
 func (a *App) renderHelpView() string {
 	var b strings.Builder
@@ -840,4 +1033,46 @@ func decodeAuthResponse(payload interface{}) (protocol.AuthResponse, error) {
 		return resp, err
 	}
 	return resp, nil
+}
+
+func decodeChatHistory(payload interface{}) (protocol.ChatHistory, error) {
+	var history protocol.ChatHistory
+	if payload == nil {
+		return history, fmt.Errorf("chat history payload empty")
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return history, err
+	}
+	if err := json.Unmarshal(data, &history); err != nil {
+		return history, err
+	}
+	return history, nil
+}
+
+func decodeChatMessage(payload interface{}) (protocol.ChatMessage, error) {
+	var msg protocol.ChatMessage
+	if payload == nil {
+		return msg, fmt.Errorf("chat message payload empty")
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return msg, err
+	}
+	if err := json.Unmarshal(data, &msg); err != nil {
+		return msg, err
+	}
+	return msg, nil
+}
+
+func metadataString(metadata map[string]interface{}, key string) string {
+	if metadata == nil {
+		return ""
+	}
+	if value, ok := metadata[key]; ok {
+		if s, ok := value.(string); ok {
+			return s
+		}
+	}
+	return ""
 }

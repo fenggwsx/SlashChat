@@ -25,4 +25,16 @@ type Store interface {
 
 	CreateUser(ctx context.Context, user *User) error
 	GetUserByUsername(ctx context.Context, username string) (*User, error)
+	SaveMessage(ctx context.Context, msg *Message) error
+	ListMessagesByRoom(ctx context.Context, room string, limit int) ([]Message, error)
+}
+
+// Message represents a persisted chat message entry.
+type Message struct {
+	ID        string
+	Room      string
+	UserID    string
+	Username  string
+	Content   string
+	CreatedAt time.Time
 }

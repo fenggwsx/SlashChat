@@ -53,3 +53,35 @@ type AuthResponse struct {
 	ExpiresAt int64  `json:"expires_at"`
 	UserID    string `json:"user_id"`
 }
+
+// JoinRequest instructs the server to subscribe the client to a room.
+type JoinRequest struct {
+	Room string `json:"room"`
+}
+
+// LeaveRequest instructs the server to remove a room subscription.
+type LeaveRequest struct {
+	Room string `json:"room"`
+}
+
+// ChatSendRequest represents a user-submitted chat message to a room.
+type ChatSendRequest struct {
+	Room    string `json:"room"`
+	Content string `json:"content"`
+}
+
+// ChatMessage captures a persisted/broadcast chat entry.
+type ChatMessage struct {
+	ID        string `json:"id"`
+	Room      string `json:"room"`
+	UserID    string `json:"user_id"`
+	Username  string `json:"username"`
+	Content   string `json:"content"`
+	CreatedAt int64  `json:"created_at"`
+}
+
+// ChatHistory bundles a batch of chat messages for a room.
+type ChatHistory struct {
+	Room     string        `json:"room"`
+	Messages []ChatMessage `json:"messages"`
+}

@@ -25,6 +25,15 @@ type userModel struct {
 	UpdatedAt time.Time
 }
 
+type messageModel struct {
+	ID        string `gorm:"primaryKey"`
+	Room      string `gorm:"index"`
+	UserID    string
+	Username  string
+	Content   string
+	CreatedAt time.Time `gorm:"index"`
+}
+
 // NewStore opens a SQLite database at the provided path.
 func NewStore(cfg config.DatabaseConfig) (*Store, error) {
 	db, err := gorm.Open(sqlite.Open(cfg.Path), &gorm.Config{})
@@ -45,7 +54,7 @@ func (s *Store) Close() error {
 
 // Migrate applies schema updates.
 func (s *Store) Migrate(ctx context.Context) error {
-	return s.db.WithContext(ctx).AutoMigrate(&userModel{})
+	return s.db.WithContext(ctx).AutoMigrate(&userModel{}, &messageModel{})
 }
 
 // CreateUser stores a new user record.
@@ -80,4 +89,45 @@ func (s *Store) GetUserByUsername(ctx context.Context, username string) (*storag
 		UpdatedAt: model.UpdatedAt,
 	}
 	return user, nil
+}
+
+// SaveMessage persists a chat message entry.
+func (s *Store) SaveMessage(ctx context.Context, msg *storage.Message) error {
+	if msg == nil {
+		return errors.New("nil message")
+	}
+	model := messageModel{
+		ID:        msg.ID,
+		Room:      msg.Room,
+		UserID:    msg.UserID,
+		Username:  msg.Username,
+		Content:   msg.Content,
+		CreatedAt: msg.CreatedAt,
+	}
+	return s.db.WithContext(ctx).Create(&model).Error
+}
+
+// ListMessagesByRoom returns the most recent messages for the specified room.
+func (s *Store) ListMessagesByRoom(ctx context.Context, room string, limit int) ([]storage.Message, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	var models []messageModel
+	if err := s.db.WithContext(ctx).Where("room = ?", room).Order("created_at desc").Limit(limit).Find(&models).Error; err != nil {
+		return nil, err
+	}
+	// Reverse to chronological order ascending
+	result := make([]storage.Message, len(models))
+	for i := range models {
+		model := models[i]
+		result[len(models)-1-i] = storage.Message{
+			ID:        model.ID,
+			Room:      model.Room,
+			UserID:    model.UserID,
+			Username:  model.Username,
+			Content:   model.Content,
+			CreatedAt: model.CreatedAt,
+		}
+	}
+	return result, nil
 }
