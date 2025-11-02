@@ -1,8 +1,11 @@
 package client
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/bubbles/help"
 	"github.com/charmbracelet/bubbles/key"
@@ -10,8 +13,10 @@ import (
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/google/uuid"
 
 	"github.com/fenggwsx/SlashChat/internal/config"
+	"github.com/fenggwsx/SlashChat/internal/protocol"
 )
 
 type activeView int
@@ -35,9 +40,12 @@ type App struct {
 	input    textinput.Model
 	helper   help.Model
 
+	session *Session
+
 	logLine logMessage
 
 	statusOnline bool
+	authToken    string
 	username     string
 	room         string
 
@@ -49,6 +57,10 @@ type App struct {
 	helpHeight int
 
 	serverAddr string
+
+	pendingRequests map[string]pendingRequest
+	lastAuthAction  string
+	lastAuthUser    string
 
 	styles styleSet
 }
@@ -62,6 +74,33 @@ type commandSpec struct {
 type logMessage struct {
 	label string
 	body  string
+}
+
+type pendingRequest struct {
+	action   string
+	username string
+}
+
+type connectResultMsg struct {
+	session *Session
+	address string
+	err     error
+}
+
+type sessionEnvelopeMsg struct {
+	session  *Session
+	envelope protocol.Envelope
+}
+
+type sessionClosedMsg struct {
+	session *Session
+}
+
+type sendResultMsg struct {
+	session     *Session
+	id          string
+	description string
+	err         error
 }
 
 type styleSet struct {
@@ -105,8 +144,9 @@ func NewApp(cfg config.ClientConfig) *App {
 		username:     "guest",
 		room:         "-",
 
-		chatHistory: []string{},
-		commands:    defaultCommands(),
+		chatHistory:     []string{},
+		commands:        defaultCommands(),
+		pendingRequests: make(map[string]pendingRequest),
 
 		styles: buildStyles(),
 	}
@@ -156,7 +196,9 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.Type == tea.KeyEnter {
 			value := strings.TrimSpace(a.input.Value())
 			if value != "" {
-				a.handleSubmit(value)
+				if submitCmd := a.handleSubmit(value); submitCmd != nil {
+					cmds = append(cmds, submitCmd)
+				}
 			}
 			a.input.SetValue("")
 			a.input.CursorEnd()
@@ -170,7 +212,57 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, cmd)
 		}
 
+		if len(cmds) == 0 {
+			return a, nil
+		}
 		return a, tea.Batch(cmds...)
+
+	case connectResultMsg:
+		if m.session != a.session {
+			return a, nil
+		}
+		if m.err != nil {
+			a.statusOnline = false
+			a.authToken = ""
+			a.logf("Failed to connect to %s: %v", m.address, m.err)
+			_ = a.session.Close()
+			a.session = nil
+			return a, nil
+		}
+		a.statusOnline = true
+		a.cfg.ServerAddr = m.address
+		a.logf("Connected to %s", m.address)
+		return a, a.listenForSession()
+
+	case sessionEnvelopeMsg:
+		if m.session != a.session {
+			return a, nil
+		}
+		a.handleSessionEnvelope(m.envelope)
+		return a, a.listenForSession()
+
+	case sessionClosedMsg:
+		if m.session != a.session {
+			return a, nil
+		}
+		a.statusOnline = false
+		a.authToken = ""
+		a.logf("Disconnected from %s", a.serverAddr)
+		a.appendSystemMessage("Disconnected from server")
+		a.session = nil
+		return a, nil
+
+	case sendResultMsg:
+		if m.session != a.session {
+			return a, nil
+		}
+		if m.err != nil {
+			if _, ok := a.pendingRequests[m.id]; ok {
+				delete(a.pendingRequests, m.id)
+			}
+			a.logf("%s failed: %v", m.description, m.err)
+		}
+		return a, nil
 
 	case tea.MouseMsg:
 		var cmd tea.Cmd
@@ -204,22 +296,24 @@ func (a *App) View() string {
 	return b.String()
 }
 
-func (a *App) handleSubmit(value string) {
+func (a *App) handleSubmit(value string) tea.Cmd {
 	if strings.HasPrefix(value, string(a.cfg.CommandPrefix)) {
-		a.executeCommand(value)
-		return
+		return a.executeCommand(value)
 	}
 
 	a.appendChatMessage(value)
+	return nil
 }
 
-func (a *App) executeCommand(raw string) {
+func (a *App) executeCommand(raw string) tea.Cmd {
 	fields := strings.Fields(raw)
 	if len(fields) == 0 {
-		return
+		return nil
 	}
 
 	cmd := fields[0]
+	var cmds []tea.Cmd
+
 	switch cmd {
 	case "/home":
 		a.view = viewHome
@@ -235,18 +329,259 @@ func (a *App) executeCommand(raw string) {
 		if len(fields) > 1 {
 			target = fields[1]
 		}
-		a.serverAddr = target
-		a.statusOnline = true
-		a.logf("Connecting to %s (stub)", target)
+		if target == "" {
+			a.logf("Provide a server address to connect")
+			break
+		}
+		if connectCmd := a.connectToServer(target); connectCmd != nil {
+			cmds = append(cmds, connectCmd)
+		}
+	case "/register":
+		if len(fields) < 3 {
+			a.logf("Usage: /register <username> <password>")
+			break
+		}
+		if !a.isConnected() {
+			a.logf("Not connected. Use /connect first.")
+			break
+		}
+		username := fields[1]
+		password := strings.Join(fields[2:], " ")
+		if strings.TrimSpace(password) == "" {
+			a.logf("Password cannot be empty")
+			break
+		}
+		a.logf("Registering %s ...", username)
+		if authCmd := a.sendAuthCommand("register", username, password); authCmd != nil {
+			cmds = append(cmds, authCmd)
+		}
+	case "/login":
+		if len(fields) < 3 {
+			a.logf("Usage: /login <username> <password>")
+			break
+		}
+		if !a.isConnected() {
+			a.logf("Not connected. Use /connect first.")
+			break
+		}
+		username := fields[1]
+		password := strings.Join(fields[2:], " ")
+		if strings.TrimSpace(password) == "" {
+			a.logf("Password cannot be empty")
+			break
+		}
+		a.logf("Logging in as %s ...", username)
+		if authCmd := a.sendAuthCommand("login", username, password); authCmd != nil {
+			cmds = append(cmds, authCmd)
+		}
 	case "/quit":
 		a.logf("Exiting client")
 		a.appendSystemMessage("Session ended. Press Ctrl+C to close.")
-		return
+		if a.session != nil {
+			_ = a.session.Close()
+			a.session = nil
+		}
+		a.statusOnline = false
+		a.authToken = ""
+		cmds = append(cmds, tea.Quit)
 	default:
 		a.logf("Command %s not implemented", cmd)
 	}
 
 	a.updateViewportContent()
+
+	switch len(cmds) {
+	case 0:
+		return nil
+	case 1:
+		return cmds[0]
+	default:
+		return tea.Batch(cmds...)
+	}
+}
+
+func (a *App) connectToServer(target string) tea.Cmd {
+	if target == "" {
+		return nil
+	}
+	if a.session != nil {
+		_ = a.session.Close()
+	}
+
+	cfg := a.cfg
+	cfg.ServerAddr = target
+	session := NewSession(cfg)
+	a.session = session
+	a.serverAddr = target
+	a.statusOnline = false
+	a.authToken = ""
+	a.pendingRequests = make(map[string]pendingRequest)
+	a.lastAuthAction = ""
+	a.lastAuthUser = ""
+	a.logf("Connecting to %s ...", target)
+
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		err := session.Connect(ctx)
+		return connectResultMsg{
+			session: session,
+			address: target,
+			err:     err,
+		}
+	}
+}
+
+func (a *App) listenForSession() tea.Cmd {
+	session := a.session
+	if session == nil {
+		return nil
+	}
+	return func() tea.Msg {
+		env, ok := <-session.Messages()
+		if !ok {
+			return sessionClosedMsg{session: session}
+		}
+		return sessionEnvelopeMsg{session: session, envelope: env}
+	}
+}
+
+func (a *App) sendAuthCommand(action, username, password string) tea.Cmd {
+	session := a.session
+	if session == nil {
+		return nil
+	}
+	if a.pendingRequests == nil {
+		a.pendingRequests = make(map[string]pendingRequest)
+	}
+	requestID := uuid.NewString()
+	a.pendingRequests[requestID] = pendingRequest{action: action, username: username}
+
+	env := protocol.Envelope{
+		ID:   requestID,
+		Type: protocol.MessageTypeAuthRequest,
+		Payload: protocol.AuthRequest{
+			Action:   action,
+			Username: username,
+			Password: password,
+		},
+	}
+
+	return a.sendEnvelope(session, env, fmt.Sprintf("%s request", action), false)
+}
+
+func (a *App) sendEnvelope(session *Session, env protocol.Envelope, description string, attachToken bool) tea.Cmd {
+	if env.ID == "" {
+		env.ID = uuid.NewString()
+	}
+	envCopy := env
+	token := a.authToken
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if attachToken && envCopy.Token == "" && token != "" {
+			envCopy.Token = token
+		}
+		err := session.Send(ctx, envCopy)
+		return sendResultMsg{
+			session:     session,
+			id:          envCopy.ID,
+			description: description,
+			err:         err,
+		}
+	}
+}
+
+func (a *App) handleSessionEnvelope(env protocol.Envelope) {
+	switch env.Type {
+	case protocol.MessageTypeAck:
+		a.handleAckEnvelope(env)
+	case protocol.MessageTypeAuthResponse:
+		a.handleAuthResponse(env)
+	default:
+		a.logf("Received %s message", string(env.Type))
+	}
+}
+
+func (a *App) handleAckEnvelope(env protocol.Envelope) {
+	ack, err := decodeAckPayload(env.Payload)
+	if err != nil {
+		a.logf("Failed to decode ack: %v", err)
+		return
+	}
+
+	pending, ok := a.pendingRequests[ack.ReferenceID]
+	if !ok {
+		if ack.Reason != "" {
+			a.logf("Server response: %s", ack.Reason)
+		}
+		return
+	}
+	delete(a.pendingRequests, ack.ReferenceID)
+
+	statusOK := strings.EqualFold(ack.Status, "ok")
+	action := strings.ToLower(pending.action)
+
+	if statusOK {
+		switch action {
+		case "register":
+			a.logf("Registration accepted for %s", pending.username)
+		case "login":
+			a.logf("Login accepted for %s", pending.username)
+		default:
+			a.logf("Command %s acknowledged", pending.action)
+		}
+		if action == "register" || action == "login" {
+			a.lastAuthAction = pending.action
+			a.lastAuthUser = pending.username
+		}
+		return
+	}
+
+	reason := ack.Reason
+	if strings.TrimSpace(reason) == "" {
+		reason = "unknown error"
+	}
+	switch action {
+	case "register":
+		a.logf("Registration failed: %s", reason)
+	case "login":
+		a.logf("Login failed: %s", reason)
+	default:
+		a.logf("Command %s failed: %s", pending.action, reason)
+	}
+	if action == "register" || action == "login" {
+		a.lastAuthAction = ""
+		a.lastAuthUser = ""
+	}
+}
+
+func (a *App) handleAuthResponse(env protocol.Envelope) {
+	resp, err := decodeAuthResponse(env.Payload)
+	if err != nil {
+		a.logf("Failed to decode auth response: %v", err)
+		return
+	}
+
+	if a.lastAuthUser != "" {
+		a.username = a.lastAuthUser
+	}
+	a.authToken = resp.Token
+
+	message := fmt.Sprintf("Authenticated as %s", a.username)
+	if resp.ExpiresAt != 0 {
+		expiresAt := time.Unix(resp.ExpiresAt, 0).UTC().Format(time.RFC3339)
+		message = fmt.Sprintf("%s (token expires %s)", message, expiresAt)
+	}
+
+	a.logf(message)
+	a.appendSystemMessage(message)
+	a.lastAuthAction = ""
+	a.lastAuthUser = ""
+}
+
+func (a *App) isConnected() bool {
+	return a.session != nil && a.statusOnline
 }
 
 func (a *App) appendSystemMessage(text string) {
@@ -392,6 +727,8 @@ func (a *App) logf(format string, args ...any) {
 func defaultCommands() []commandSpec {
 	return []commandSpec{
 		{trigger: "/connect", usage: "/connect [addr]", description: "Connect to the server"},
+		{trigger: "/register", usage: "/register <username> <password>", description: "Register a new account"},
+		{trigger: "/login", usage: "/login <username> <password>", description: "Authenticate with existing credentials"},
 		{trigger: "/home", usage: "/home", description: "Switch to home view"},
 		{trigger: "/chat", usage: "/chat", description: "Switch to chat view"},
 		{trigger: "/help", usage: "/help", description: "Show command help"},
@@ -438,7 +775,7 @@ func countLines(s string) int {
 	return strings.Count(s, "\n") + 1
 }
 
-const homeContent = "SlashChat\n\nUse /connect to reach the server.\nUse /help to browse all commands."
+const homeContent = "SlashChat\n\nUse /connect to reach the server.\nUse /register or /login after connecting.\nUse /help to browse all commands."
 
 func (a *App) renderHelpView() string {
 	var b strings.Builder
@@ -473,4 +810,34 @@ func (a *App) statusValueStyle(status string) lipgloss.Style {
 
 func (a *App) logLineView() string {
 	return a.styles.logLabel.Render(a.logLine.label) + " " + a.styles.logBody.Render(a.logLine.body)
+}
+
+func decodeAckPayload(payload interface{}) (protocol.AckPayload, error) {
+	var ack protocol.AckPayload
+	if payload == nil {
+		return ack, fmt.Errorf("ack payload empty")
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return ack, err
+	}
+	if err := json.Unmarshal(data, &ack); err != nil {
+		return ack, err
+	}
+	return ack, nil
+}
+
+func decodeAuthResponse(payload interface{}) (protocol.AuthResponse, error) {
+	var resp protocol.AuthResponse
+	if payload == nil {
+		return resp, fmt.Errorf("auth response payload empty")
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return resp, err
+	}
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return resp, err
+	}
+	return resp, nil
 }

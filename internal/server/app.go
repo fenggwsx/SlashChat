@@ -108,6 +108,8 @@ func (a *App) routeEnvelope(ctx context.Context, encoder *protocol.Encoder, env 
 	switch env.Type {
 	case protocol.MessageTypeAuthRequest:
 		a.handleAuth(ctx, encoder, env)
+	case protocol.MessageTypeAck:
+		// Client-generated acknowledgements (e.g. keepalive heartbeats) are ignored for now.
 	case protocol.MessageTypeCommand, protocol.MessageTypeEvent, protocol.MessageTypeFileChunk:
 		a.hub.Broadcast(env)
 	default:
