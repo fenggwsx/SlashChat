@@ -864,6 +864,9 @@ func (a *App) sendEnvelope(session *Session, env protocol.Envelope, description 
 		env.ID = uuid.NewString()
 	}
 	envCopy := env
+	if envCopy.Timestamp.IsZero() {
+		envCopy.Timestamp = time.Now().UTC()
+	}
 	if attachToken && envCopy.Token == "" && strings.TrimSpace(a.authToken) != "" {
 		envCopy.Token = a.authToken
 	}
