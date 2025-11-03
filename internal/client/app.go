@@ -1258,7 +1258,7 @@ func (a *App) statusLine() string {
 	}
 
 	parts := []string{
-		a.styles.title.Render("GoSlash"),
+		a.styles.title.Render("SlashChat"),
 		a.styles.view.Render(strings.ToUpper(a.view.String())),
 		a.statusValueStyle(status).Render(status),
 		a.styles.label.Render("Server") + ": " + a.styles.value.Render(a.serverAddr),
