@@ -792,6 +792,10 @@ func (a *App) sendChatMessage(content string) tea.Cmd {
 	if a.pendingRequests == nil {
 		a.pendingRequests = make(map[string]pendingRequest)
 	}
+	if a.view != viewChat && a.hasActiveRoom() {
+		a.view = viewChat
+		a.updateViewportContent()
+	}
 	requestID := uuid.NewString()
 	a.pendingRequests[requestID] = pendingRequest{action: "chat_send", room: room}
 	a.logf("Sending message to %s ...", room)
