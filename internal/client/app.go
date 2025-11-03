@@ -19,6 +19,7 @@ import (
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	figure "github.com/common-nighthawk/go-figure"
 	"github.com/google/uuid"
 
 	"github.com/fenggwsx/SlashChat/internal/config"
@@ -1290,7 +1291,25 @@ func countLines(s string) int {
 	return strings.Count(s, "\n") + 1
 }
 
-const homeContent = "SlashChat\n\nUse /connect to reach the server.\nUse /register or /login after connecting.\nUse /join <room> to load chat history.\nUse /download <message_id> to retrieve shared files.\nUse /help to browse all commands."
+var homeContent = buildHomeContent()
+
+func buildHomeContent() string {
+	fig := figure.NewColorFigure("SLASH CHAT", "3-d", "green", true)
+	art := strings.TrimRight(fig.String(), "\n")
+	info := []string{
+		"Use /connect to reach the server.",
+		"Use /register or /login after connecting.",
+		"Use /join <room> to load chat history.",
+		"Use /download <message_id> to retrieve shared files.",
+		"Use /help to browse all commands.",
+	}
+
+	var b strings.Builder
+	b.WriteString(art)
+	b.WriteString("\n\n")
+	b.WriteString(strings.Join(info, "\n"))
+	return b.String()
+}
 
 func (a *App) renderHelpView() string {
 	var b strings.Builder
