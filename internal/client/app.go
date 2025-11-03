@@ -79,9 +79,17 @@ type commandSpec struct {
 	description string
 }
 
+type logLevel int
+
+const (
+	logLevelInfo logLevel = iota
+	logLevelError
+)
+
 type logMessage struct {
 	label string
 	body  string
+	level logLevel
 }
 
 type pendingRequest struct {
@@ -127,6 +135,8 @@ type styleSet struct {
 	value         lipgloss.Style
 	logLabel      lipgloss.Style
 	logBody       lipgloss.Style
+	logLabelError lipgloss.Style
+	logBodyError  lipgloss.Style
 	help          lipgloss.Style
 }
 
@@ -153,7 +163,7 @@ func NewApp(cfg config.ClientConfig) *App {
 		input:    input,
 		helper:   helper,
 
-		logLine: logMessage{label: "[msg]", body: "GoSlash client ready"},
+		logLine: logMessage{label: "[msg]", body: "GoSlash client ready", level: logLevelInfo},
 
 		statusOnline: false,
 		username:     "guest",
@@ -247,7 +257,7 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.err != nil {
 			a.statusOnline = false
 			a.authToken = ""
-			a.logf("Failed to connect to %s: %v", m.address, m.err)
+			a.logErrorf("Failed to connect to %s: %v", m.address, m.err)
 			_ = a.session.Close()
 			a.session = nil
 			return a, nil
@@ -285,7 +295,7 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if _, ok := a.pendingRequests[m.id]; ok {
 				delete(a.pendingRequests, m.id)
 			}
-			a.logf("%s failed: %v", m.description, m.err)
+			a.logErrorf("%s failed: %v", m.description, m.err)
 		}
 		return a, nil
 
@@ -347,11 +357,11 @@ func (a *App) executeCommand(raw string) tea.Cmd {
 		a.logf("Switched to HELP view")
 	case "/join":
 		if len(fields) < 2 {
-			a.logf("Usage: /join <room>")
+			a.logErrorf("Usage: /join <room>")
 			break
 		}
 		if !a.isConnected() {
-			a.logf("Not connected. Use /connect first.")
+			a.logErrorf("Not connected. Use /connect first.")
 			break
 		}
 		room := fields[1]
@@ -365,7 +375,7 @@ func (a *App) executeCommand(raw string) tea.Cmd {
 		}
 	case "/leave":
 		if !a.isConnected() {
-			a.logf("Not connected. Use /connect first.")
+			a.logErrorf("Not connected. Use /connect first.")
 			break
 		}
 		targetRoom := strings.TrimSpace(a.room)
@@ -373,7 +383,7 @@ func (a *App) executeCommand(raw string) tea.Cmd {
 			targetRoom = fields[1]
 		}
 		if targetRoom == "" || targetRoom == "-" {
-			a.logf("No active room to leave")
+			a.logErrorf("No active room to leave")
 			break
 		}
 		a.logf("Leaving room %s ...", targetRoom)
@@ -386,7 +396,7 @@ func (a *App) executeCommand(raw string) tea.Cmd {
 			target = fields[1]
 		}
 		if target == "" {
-			a.logf("Provide a server address to connect")
+			a.logErrorf("Provide a server address to connect")
 			break
 		}
 		if connectCmd := a.connectToServer(target); connectCmd != nil {
@@ -394,17 +404,17 @@ func (a *App) executeCommand(raw string) tea.Cmd {
 		}
 	case "/register":
 		if len(fields) < 3 {
-			a.logf("Usage: /register <username> <password>")
+			a.logErrorf("Usage: /register <username> <password>")
 			break
 		}
 		if !a.isConnected() {
-			a.logf("Not connected. Use /connect first.")
+			a.logErrorf("Not connected. Use /connect first.")
 			break
 		}
 		username := fields[1]
 		password := strings.Join(fields[2:], " ")
 		if strings.TrimSpace(password) == "" {
-			a.logf("Password cannot be empty")
+			a.logErrorf("Password cannot be empty")
 			break
 		}
 		a.logf("Registering %s ...", username)
@@ -413,16 +423,16 @@ func (a *App) executeCommand(raw string) tea.Cmd {
 		}
 	case "/upload":
 		if len(fields) < 2 {
-			a.logf("Usage: /upload <path>")
+			a.logErrorf("Usage: /upload <path>")
 			break
 		}
 		if !a.isConnected() {
-			a.logf("Not connected. Use /connect first.")
+			a.logErrorf("Not connected. Use /connect first.")
 			break
 		}
 		activeRoom := strings.TrimSpace(a.room)
 		if activeRoom == "" || activeRoom == "-" {
-			a.logf("Join a room before uploading")
+			a.logErrorf("Join a room before uploading")
 			break
 		}
 		path := strings.Join(fields[1:], " ")
@@ -431,15 +441,15 @@ func (a *App) executeCommand(raw string) tea.Cmd {
 		}
 	case "/download":
 		if len(fields) < 2 {
-			a.logf("Usage: /download <message_id>")
+			a.logErrorf("Usage: /download <message_id>")
 			break
 		}
 		if !a.isConnected() {
-			a.logf("Not connected. Use /connect first.")
+			a.logErrorf("Not connected. Use /connect first.")
 			break
 		}
 		if !a.hasActiveRoom() {
-			a.logf("Join a room before downloading")
+			a.logErrorf("Join a room before downloading")
 			break
 		}
 		messageID := strings.TrimSpace(fields[1])
@@ -448,17 +458,17 @@ func (a *App) executeCommand(raw string) tea.Cmd {
 		}
 	case "/login":
 		if len(fields) < 3 {
-			a.logf("Usage: /login <username> <password>")
+			a.logErrorf("Usage: /login <username> <password>")
 			break
 		}
 		if !a.isConnected() {
-			a.logf("Not connected. Use /connect first.")
+			a.logErrorf("Not connected. Use /connect first.")
 			break
 		}
 		username := fields[1]
 		password := strings.Join(fields[2:], " ")
 		if strings.TrimSpace(password) == "" {
-			a.logf("Password cannot be empty")
+			a.logErrorf("Password cannot be empty")
 			break
 		}
 		a.logf("Logging in as %s ...", username)
@@ -475,7 +485,7 @@ func (a *App) executeCommand(raw string) tea.Cmd {
 		a.authToken = ""
 		cmds = append(cmds, tea.Quit)
 	default:
-		a.logf("Command %s not implemented", cmd)
+		a.logErrorf("Command %s not implemented", cmd)
 	}
 
 	a.updateViewportContent()
@@ -623,26 +633,26 @@ func (a *App) startFileUpload(path string) tea.Cmd {
 	}
 	room := strings.TrimSpace(a.room)
 	if room == "" || room == "-" {
-		a.logf("Join a room before uploading")
+		a.logErrorf("Join a room before uploading")
 		return nil
 	}
 	path = strings.TrimSpace(path)
 	if path == "" {
-		a.logf("Usage: /upload <path>")
+		a.logErrorf("Usage: /upload <path>")
 		return nil
 	}
 	info, err := os.Stat(path)
 	if err != nil {
-		a.logf("Cannot access %s: %v", path, err)
+		a.logErrorf("Cannot access %s: %v", path, err)
 		return nil
 	}
 	if info.IsDir() {
-		a.logf("Cannot upload a directory")
+		a.logErrorf("Cannot upload a directory")
 		return nil
 	}
 	data, err := os.ReadFile(path)
 	if err != nil {
-		a.logf("Cannot read %s: %v", path, err)
+		a.logErrorf("Cannot read %s: %v", path, err)
 		return nil
 	}
 	sum := sha256.Sum256(data)
@@ -692,11 +702,11 @@ func (a *App) sendFileUpload(p pendingRequest) tea.Cmd {
 	}
 	room := strings.TrimSpace(p.room)
 	if room == "" || room == "-" {
-		a.logf("No active room to receive upload")
+		a.logErrorf("No active room to receive upload")
 		return nil
 	}
 	if strings.TrimSpace(p.data) == "" {
-		a.logf("No file data available for upload")
+		a.logErrorf("No file data available for upload")
 		return nil
 	}
 	if a.pendingRequests == nil {
@@ -743,13 +753,13 @@ func (a *App) startFileDownload(messageID string) tea.Cmd {
 
 	value := strings.TrimSpace(messageID)
 	if value == "" {
-		a.logf("Usage: /download <message_id>")
+		a.logErrorf("Usage: /download <message_id>")
 		return nil
 	}
 
 	idValue, err := strconv.ParseUint(value, 10, 64)
 	if err != nil || idValue == 0 {
-		a.logf("Invalid message id: %s", value)
+		a.logErrorf("Invalid message id: %s", value)
 		return nil
 	}
 
@@ -777,12 +787,12 @@ func (a *App) sendChatMessage(content string) tea.Cmd {
 		return nil
 	}
 	if !a.isConnected() {
-		a.logf("Not connected. Use /connect first.")
+		a.logErrorf("Not connected. Use /connect first.")
 		return nil
 	}
 	room := strings.TrimSpace(a.room)
 	if room == "" || room == "-" {
-		a.logf("Join a room before chatting (use /join <room>)")
+		a.logErrorf("Join a room before chatting (use /join <room>)")
 		return nil
 	}
 	session := a.session
@@ -846,7 +856,7 @@ func (a *App) handleSessionEnvelope(env protocol.Envelope) tea.Cmd {
 	case protocol.MessageTypeFileDownload:
 		a.handleFileDownload(env)
 	default:
-		a.logf("Received %s message", string(env.Type))
+		a.logErrorf("Received %s message", string(env.Type))
 	}
 	return nil
 }
@@ -854,7 +864,7 @@ func (a *App) handleSessionEnvelope(env protocol.Envelope) tea.Cmd {
 func (a *App) handleAckEnvelope(env protocol.Envelope) tea.Cmd {
 	ack, err := decodeAckPayload(env.Payload)
 	if err != nil {
-		a.logf("Failed to decode ack: %v", err)
+		a.logErrorf("Failed to decode ack: %v", err)
 		return nil
 	}
 
@@ -916,23 +926,23 @@ func (a *App) handleAckEnvelope(env protocol.Envelope) tea.Cmd {
 		}
 		switch action {
 		case "register":
-			a.logf("Registration failed: %s", reason)
+			a.logErrorf("Registration failed: %s", reason)
 		case "login":
-			a.logf("Login failed: %s", reason)
+			a.logErrorf("Login failed: %s", reason)
 		case "join":
-			a.logf("Join failed: %s", reason)
+			a.logErrorf("Join failed: %s", reason)
 		case "leave":
-			a.logf("Leave failed: %s", reason)
+			a.logErrorf("Leave failed: %s", reason)
 		case "chat_send":
-			a.logf("Message failed: %s", reason)
+			a.logErrorf("Message failed: %s", reason)
 		case "file_upload_prepare":
-			a.logf("Upload prepare failed: %s", reason)
+			a.logErrorf("Upload prepare failed: %s", reason)
 		case "file_upload":
-			a.logf("Upload failed: %s", reason)
+			a.logErrorf("Upload failed: %s", reason)
 		case "file_download":
-			a.logf("Download failed: %s", reason)
+			a.logErrorf("Download failed: %s", reason)
 		default:
-			a.logf("Command %s failed: %s", pending.action, reason)
+			a.logErrorf("Command %s failed: %s", pending.action, reason)
 		}
 		if action == "register" || action == "login" {
 			a.lastAuthAction = ""
@@ -945,7 +955,7 @@ func (a *App) handleAckEnvelope(env protocol.Envelope) tea.Cmd {
 func (a *App) handleAuthResponse(env protocol.Envelope) {
 	resp, err := decodeAuthResponse(env.Payload)
 	if err != nil {
-		a.logf("Failed to decode auth response: %v", err)
+		a.logErrorf("Failed to decode auth response: %v", err)
 		return
 	}
 
@@ -973,31 +983,31 @@ func (a *App) handleEventEnvelope(env protocol.Envelope) {
 	case "chat_message":
 		a.handleChatMessage(env)
 	default:
-		a.logf("Unhandled event action: %s", action)
+		a.logErrorf("Unhandled event action: %s", action)
 	}
 }
 
 func (a *App) handleFileDownload(env protocol.Envelope) {
 	payload, err := decodeFileDownloadPayload(env.Payload)
 	if err != nil {
-		a.logf("Failed to decode download payload: %v", err)
+		a.logErrorf("Failed to decode download payload: %v", err)
 		return
 	}
 
 	if payload.MessageID == 0 {
-		a.logf("Download payload missing message id")
+		a.logErrorf("Download payload missing message id")
 		return
 	}
 
 	data, err := base64.StdEncoding.DecodeString(payload.DataBase64)
 	if err != nil {
-		a.logf("Failed to decode download data: %v", err)
+		a.logErrorf("Failed to decode download data: %v", err)
 		return
 	}
 
 	path, err := a.writeDownloadedFile(payload.Filename, payload.SHA256, data)
 	if err != nil {
-		a.logf("Failed to save download: %v", err)
+		a.logErrorf("Failed to save download: %v", err)
 		return
 	}
 
@@ -1015,12 +1025,12 @@ func (a *App) isConnected() bool {
 func (a *App) handleChatHistory(env protocol.Envelope) {
 	history, err := decodeChatHistory(env.Payload)
 	if err != nil {
-		a.logf("Failed to decode chat history: %v", err)
+		a.logErrorf("Failed to decode chat history: %v", err)
 		return
 	}
 	r := strings.TrimSpace(history.Room)
 	if r == "" {
-		a.logf("Received chat history without room")
+		a.logErrorf("Received chat history without room")
 		return
 	}
 	a.room = r
@@ -1038,7 +1048,7 @@ func (a *App) handleChatHistory(env protocol.Envelope) {
 func (a *App) handleChatMessage(env protocol.Envelope) {
 	msg, err := decodeChatMessage(env.Payload)
 	if err != nil {
-		a.logf("Failed to decode chat message: %v", err)
+		a.logErrorf("Failed to decode chat message: %v", err)
 		return
 	}
 	room := strings.TrimSpace(msg.Room)
@@ -1259,6 +1269,15 @@ func (a *App) logf(format string, args ...any) {
 	a.logLine = logMessage{
 		label: "[msg]",
 		body:  fmt.Sprintf(format, args...),
+		level: logLevelInfo,
+	}
+}
+
+func (a *App) logErrorf(format string, args ...any) {
+	a.logLine = logMessage{
+		label: "[err]",
+		body:  fmt.Sprintf(format, args...),
+		level: logLevelError,
 	}
 }
 
@@ -1464,6 +1483,8 @@ func buildStyles() styleSet {
 		value:         base.Foreground(lipgloss.Color("15")),            // bright white
 		logLabel:      base.Foreground(lipgloss.Color("11")).Bold(true), // bright yellow
 		logBody:       base.Foreground(lipgloss.Color("7")),             // white
+		logLabelError: base.Foreground(lipgloss.Color("9")).Bold(true),  // bright red
+		logBodyError:  base.Foreground(lipgloss.Color("9")),             // bright red
 		help:          base.Foreground(lipgloss.Color("12")),            // bright blue
 	}
 }
@@ -1476,7 +1497,13 @@ func (a *App) statusValueStyle(status string) lipgloss.Style {
 }
 
 func (a *App) logLineView() string {
-	return a.styles.logLabel.Render(a.logLine.label) + " " + a.styles.logBody.Render(a.logLine.body)
+	labelStyle := a.styles.logLabel
+	bodyStyle := a.styles.logBody
+	if a.logLine.level == logLevelError {
+		labelStyle = a.styles.logLabelError
+		bodyStyle = a.styles.logBodyError
+	}
+	return labelStyle.Render(a.logLine.label) + " " + bodyStyle.Render(a.logLine.body)
 }
 
 func decodeAckPayload(payload interface{}) (protocol.AckPayload, error) {
