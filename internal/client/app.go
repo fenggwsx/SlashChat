@@ -33,6 +33,7 @@ type activeView int
 const (
 	viewChat activeView = iota
 	viewHelp
+	viewPipe
 )
 
 // App encapsulates the Bubble Tea TUI state for the GoSlash client.
@@ -70,6 +71,8 @@ type App struct {
 	lastAuthAction  string
 	lastAuthUser    string
 
+	pipeHistory []pipeEntry
+
 	styles styleSet
 }
 
@@ -86,10 +89,26 @@ const (
 	logLevelError
 )
 
+type pipeDirection string
+
+const (
+	pipeDirectionOut pipeDirection = "->"
+	pipeDirectionIn  pipeDirection = "<-"
+)
+
+const pipeHistoryLimit = 200
+
 type logMessage struct {
 	label string
 	body  string
 	level logLevel
+}
+
+type pipeEntry struct {
+	direction   pipeDirection
+	messageType string
+	timestamp   time.Time
+	body        string
 }
 
 type pendingRequest struct {
@@ -172,6 +191,7 @@ func NewApp(cfg config.ClientConfig) *App {
 		chatHistory:     []string{},
 		commands:        defaultCommands(),
 		pendingRequests: make(map[string]pendingRequest),
+		pipeHistory:     make([]pipeEntry, 0, pipeHistoryLimit),
 
 		styles: buildStyles(),
 	}
@@ -456,6 +476,18 @@ func (a *App) executeCommand(raw string) tea.Cmd {
 		if downloadCmd := a.startFileDownload(messageID); downloadCmd != nil {
 			cmds = append(cmds, downloadCmd)
 		}
+	case "/pipe":
+		if len(fields) > 1 && strings.EqualFold(fields[1], "clear") {
+			a.pipeHistory = make([]pipeEntry, 0, pipeHistoryLimit)
+			a.logf("Cleared pipe history")
+			if a.view == viewPipe {
+				a.updateViewportContent()
+			}
+			break
+		}
+		a.view = viewPipe
+		a.logf("Switched to PIPE view")
+		a.updateViewportContent()
 	case "/login":
 		if len(fields) < 3 {
 			a.logErrorf("Usage: /login <username> <password>")
@@ -832,13 +864,13 @@ func (a *App) sendEnvelope(session *Session, env protocol.Envelope, description 
 		env.ID = uuid.NewString()
 	}
 	envCopy := env
-	token := a.authToken
+	if attachToken && envCopy.Token == "" && strings.TrimSpace(a.authToken) != "" {
+		envCopy.Token = a.authToken
+	}
+	a.appendPipeEntry(pipeDirectionOut, envCopy)
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		if attachToken && envCopy.Token == "" && token != "" {
-			envCopy.Token = token
-		}
 		err := session.Send(ctx, envCopy)
 		return sendResultMsg{
 			session:     session,
@@ -850,6 +882,7 @@ func (a *App) sendEnvelope(session *Session, env protocol.Envelope, description 
 }
 
 func (a *App) handleSessionEnvelope(env protocol.Envelope) tea.Cmd {
+	a.appendPipeEntry(pipeDirectionIn, env)
 	switch env.Type {
 	case protocol.MessageTypeAck:
 		return a.handleAckEnvelope(env)
@@ -1078,6 +1111,30 @@ func (a *App) appendChatLine(line string) {
 	}
 }
 
+func (a *App) appendPipeEntry(direction pipeDirection, env protocol.Envelope) {
+	if a.pipeHistory == nil {
+		a.pipeHistory = make([]pipeEntry, 0, pipeHistoryLimit)
+	}
+	bodyBytes, err := json.MarshalIndent(env, "", "  ")
+	entry := pipeEntry{
+		direction:   direction,
+		messageType: string(env.Type),
+		timestamp:   time.Now(),
+		body:        string(bodyBytes),
+	}
+	if err != nil {
+		entry.body = fmt.Sprintf(`{"marshal_error":%q}`, err.Error())
+	}
+	if len(a.pipeHistory) >= pipeHistoryLimit {
+		a.pipeHistory = append(a.pipeHistory[1:], entry)
+	} else {
+		a.pipeHistory = append(a.pipeHistory, entry)
+	}
+	if a.view == viewPipe {
+		a.updateViewportContent()
+	}
+}
+
 func (a *App) formatChatMessage(msg protocol.ChatMessage) string {
 	username := strings.TrimSpace(msg.Username)
 	if username == "" {
@@ -1169,6 +1226,17 @@ func (a *App) updateViewportContent() {
 		} else {
 			lines := wrapLines(a.chatHistory, width)
 			a.viewport.SetContent(strings.Join(lines, "\n"))
+		}
+		a.viewport.GotoBottom()
+	case viewPipe:
+		width := a.viewport.Width
+		if width <= 0 {
+			width = a.width
+		}
+		if len(a.pipeHistory) == 0 {
+			a.viewport.SetContent("No transport frames captured yet. Send commands to populate this view or use /pipe clear to reset.")
+		} else {
+			a.viewport.SetContent(a.renderPipeView(width))
 		}
 		a.viewport.GotoBottom()
 	case viewHelp:
@@ -1296,6 +1364,7 @@ func defaultCommands() []commandSpec {
 		{trigger: "/leave", usage: "/leave", description: "Leave current room"},
 		{trigger: "/upload", usage: "/upload <path>", description: "Upload a file"},
 		{trigger: "/download", usage: "/download <message_id>", description: "Download a file shared in chat"},
+		{trigger: "/pipe", usage: "/pipe [clear]", description: "Inspect transport JSON frames"},
 		{trigger: "/quit", usage: "/quit", description: "Exit the client"},
 	}
 }
@@ -1306,6 +1375,8 @@ func (v activeView) String() string {
 		return "chat"
 	case viewHelp:
 		return "help"
+	case viewPipe:
+		return "pipe"
 	default:
 		return "unknown"
 	}
@@ -1457,6 +1528,7 @@ func buildHomeContent() string {
 		"Use /register or /login after connecting.",
 		"Use /join <room> to load chat history.",
 		"Use /download <message_id> to retrieve shared files.",
+		"Use /pipe to inspect raw transport frames.",
 		"Use /help to browse all commands.",
 	}
 
@@ -1474,6 +1546,29 @@ func (a *App) renderHelpView() string {
 		b.WriteString(fmt.Sprintf("%-18s %s\n", c.usage, c.description))
 	}
 	return strings.TrimRight(b.String(), "\n")
+}
+
+func (a *App) renderPipeView(width int) string {
+	_ = width
+	if len(a.pipeHistory) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	for i, entry := range a.pipeHistory {
+		ts := entry.timestamp.Format("15:04:05.000")
+		kind := strings.ToUpper(entry.messageType)
+		if kind == "" {
+			kind = "UNKNOWN"
+		}
+		header := fmt.Sprintf("[%s %s %s]", ts, entry.direction, kind)
+		b.WriteString(a.styles.label.Render(header))
+		b.WriteString("\n")
+		b.WriteString(entry.body)
+		if i < len(a.pipeHistory)-1 {
+			b.WriteString("\n\n")
+		}
+	}
+	return b.String()
 }
 
 func buildStyles() styleSet {
