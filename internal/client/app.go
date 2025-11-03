@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/charmbracelet/bubbles/help"
 	"github.com/charmbracelet/bubbles/key"
@@ -21,6 +22,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	figure "github.com/common-nighthawk/go-figure"
 	"github.com/google/uuid"
+	"github.com/mattn/go-runewidth"
 
 	"github.com/fenggwsx/SlashChat/internal/config"
 	"github.com/fenggwsx/SlashChat/internal/protocol"
@@ -1140,10 +1142,15 @@ func (a *App) updateViewportContent() {
 			a.viewport.SetContent(homeContent)
 			return
 		}
+		width := a.viewport.Width
+		if width <= 0 {
+			width = a.width
+		}
 		if len(a.chatHistory) == 0 {
 			a.viewport.SetContent("No chat messages yet. Type and press Enter to send.")
 		} else {
-			a.viewport.SetContent(strings.Join(a.chatHistory, "\n"))
+			lines := wrapLines(a.chatHistory, width)
+			a.viewport.SetContent(strings.Join(lines, "\n"))
 		}
 		a.viewport.GotoBottom()
 	case viewHelp:
@@ -1353,6 +1360,64 @@ func longestCommonPrefix(values []string) string {
 		}
 	}
 	return prefix
+}
+
+func wrapLines(lines []string, width int) []string {
+	if width <= 0 {
+		return lines
+	}
+	const minWidth = 10
+	if width < minWidth {
+		width = minWidth
+	}
+
+	wrapped := make([]string, 0, len(lines))
+	for _, line := range lines {
+		segment := line
+		if segment == "" {
+			wrapped = append(wrapped, "")
+			continue
+		}
+		for len(segment) > 0 {
+			if runewidth.StringWidth(segment) <= width {
+				wrapped = append(wrapped, segment)
+				break
+			}
+			cut := wrapCutIndex(segment, width)
+			part := strings.TrimRight(segment[:cut], " ")
+			if part == "" && cut > 0 {
+				part = segment[:cut]
+			}
+			wrapped = append(wrapped, part)
+			segment = strings.TrimLeft(segment[cut:], " ")
+			if segment == "" {
+				break
+			}
+		}
+	}
+	return wrapped
+}
+
+func wrapCutIndex(s string, limit int) int {
+	var width int
+	lastSpace := -1
+	for i, r := range s {
+		rw := runewidth.RuneWidth(r)
+		if width+rw > limit {
+			if lastSpace >= 0 {
+				return lastSpace + 1
+			}
+			if width == 0 {
+				return i + 1
+			}
+			return i
+		}
+		width += rw
+		if unicode.IsSpace(r) {
+			lastSpace = i
+		}
+	}
+	return len(s)
 }
 
 var homeContent = buildHomeContent()
