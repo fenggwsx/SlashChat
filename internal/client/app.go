@@ -838,7 +838,7 @@ func (a *App) sendChatMessage(content string) tea.Cmd {
 	if a.pendingRequests == nil {
 		a.pendingRequests = make(map[string]pendingRequest)
 	}
-	if a.view != viewChat && a.hasActiveRoom() {
+	if a.view != viewChat && a.view != viewPipe && a.hasActiveRoom() {
 		a.view = viewChat
 		a.updateViewportContent()
 	}
