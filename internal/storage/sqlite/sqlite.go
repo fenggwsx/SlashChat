@@ -157,3 +157,39 @@ func (s *Store) ListMessagesByRoom(ctx context.Context, room string, limit int) 
 	}
 	return result, nil
 }
+
+// GetMessageByID returns a single message by its identifier.
+func (s *Store) GetMessageByID(ctx context.Context, id uint) (*storage.Message, error) {
+	var model Message
+	if err := s.db.WithContext(ctx).
+		Preload("User").
+		First(&model, id).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, storage.ErrNotFound
+		}
+		return nil, err
+	}
+
+	var userPtr *storage.User
+	if model.User != nil && model.User.ID != 0 {
+		userCopy := storage.User{
+			ID:        model.User.ID,
+			Username:  model.User.Username,
+			CreatedAt: model.User.CreatedAt,
+			UpdatedAt: model.User.UpdatedAt,
+		}
+		userPtr = &userCopy
+	}
+
+	msg := &storage.Message{
+		ID:        model.ID,
+		Room:      model.Room,
+		UserID:    model.UserID,
+		Content:   model.Content,
+		Kind:      model.Kind,
+		FileSHA:   model.FileSHA,
+		CreatedAt: model.CreatedAt,
+		User:      userPtr,
+	}
+	return msg, nil
+}

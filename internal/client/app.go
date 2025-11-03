@@ -5,9 +5,11 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -80,14 +82,15 @@ type logMessage struct {
 }
 
 type pendingRequest struct {
-	action   string
-	username string
-	room     string
-	filePath string
-	fileName string
-	sha      string
-	data     string
-	size     int64
+	action    string
+	username  string
+	room      string
+	filePath  string
+	fileName  string
+	sha       string
+	data      string
+	size      int64
+	messageID uint
 }
 
 type connectResultMsg struct {
@@ -415,6 +418,23 @@ func (a *App) executeCommand(raw string) tea.Cmd {
 		if uploadCmd := a.startFileUpload(path); uploadCmd != nil {
 			cmds = append(cmds, uploadCmd)
 		}
+	case "/download":
+		if len(fields) < 2 {
+			a.logf("Usage: /download <message_id>")
+			break
+		}
+		if !a.isConnected() {
+			a.logf("Not connected. Use /connect first.")
+			break
+		}
+		if !a.hasActiveRoom() {
+			a.logf("Join a room before downloading")
+			break
+		}
+		messageID := strings.TrimSpace(fields[1])
+		if downloadCmd := a.startFileDownload(messageID); downloadCmd != nil {
+			cmds = append(cmds, downloadCmd)
+		}
 	case "/login":
 		if len(fields) < 3 {
 			a.logf("Usage: /login <username> <password>")
@@ -700,6 +720,46 @@ func (a *App) sendFileUpload(p pendingRequest) tea.Cmd {
 	return a.sendEnvelope(session, env, "file upload", true)
 }
 
+func (a *App) startFileDownload(messageID string) tea.Cmd {
+	session := a.session
+	if session == nil {
+		return nil
+	}
+
+	if a.pendingRequests == nil {
+		a.pendingRequests = make(map[string]pendingRequest)
+	}
+
+	value := strings.TrimSpace(messageID)
+	if value == "" {
+		a.logf("Usage: /download <message_id>")
+		return nil
+	}
+
+	idValue, err := strconv.ParseUint(value, 10, 64)
+	if err != nil || idValue == 0 {
+		a.logf("Invalid message id: %s", value)
+		return nil
+	}
+
+	id := uint(idValue)
+	requestID := uuid.NewString()
+	a.pendingRequests[requestID] = pendingRequest{action: "file_download", messageID: id}
+	a.logf("Requesting download for message #%d ...", id)
+
+	env := protocol.Envelope{
+		ID:   requestID,
+		Type: protocol.MessageTypeCommand,
+		Metadata: map[string]interface{}{
+			"action":     "file_download",
+			"message_id": fmt.Sprintf("%d", id),
+		},
+		Payload: protocol.FileDownloadRequest{MessageID: id},
+	}
+
+	return a.sendEnvelope(session, env, "file download", true)
+}
+
 func (a *App) sendChatMessage(content string) tea.Cmd {
 	content = strings.TrimSpace(content)
 	if content == "" {
@@ -768,6 +828,8 @@ func (a *App) handleSessionEnvelope(env protocol.Envelope) tea.Cmd {
 		a.handleAuthResponse(env)
 	case protocol.MessageTypeEvent:
 		a.handleEventEnvelope(env)
+	case protocol.MessageTypeFileDownload:
+		a.handleFileDownload(env)
 	default:
 		a.logf("Received %s message", string(env.Type))
 	}
@@ -815,6 +877,8 @@ func (a *App) handleAckEnvelope(env protocol.Envelope) tea.Cmd {
 			a.logf("Uploaded %s to %s", pending.fileName, pending.room)
 		case "chat_send":
 			a.logf("Message delivered to %s", pending.room)
+		case "file_download":
+			a.logf("Download accepted for message #%d", pending.messageID)
 		default:
 			a.logf("Command %s acknowledged", pending.action)
 		}
@@ -850,6 +914,8 @@ func (a *App) handleAckEnvelope(env protocol.Envelope) tea.Cmd {
 			a.logf("Upload prepare failed: %s", reason)
 		case "file_upload":
 			a.logf("Upload failed: %s", reason)
+		case "file_download":
+			a.logf("Download failed: %s", reason)
 		default:
 			a.logf("Command %s failed: %s", pending.action, reason)
 		}
@@ -894,6 +960,37 @@ func (a *App) handleEventEnvelope(env protocol.Envelope) {
 	default:
 		a.logf("Unhandled event action: %s", action)
 	}
+}
+
+func (a *App) handleFileDownload(env protocol.Envelope) {
+	payload, err := decodeFileDownloadPayload(env.Payload)
+	if err != nil {
+		a.logf("Failed to decode download payload: %v", err)
+		return
+	}
+
+	if payload.MessageID == 0 {
+		a.logf("Download payload missing message id")
+		return
+	}
+
+	data, err := base64.StdEncoding.DecodeString(payload.DataBase64)
+	if err != nil {
+		a.logf("Failed to decode download data: %v", err)
+		return
+	}
+
+	path, err := a.writeDownloadedFile(payload.Filename, payload.SHA256, data)
+	if err != nil {
+		a.logf("Failed to save download: %v", err)
+		return
+	}
+
+	name := strings.TrimSpace(payload.Filename)
+	if name == "" {
+		name = filepath.Base(path)
+	}
+	a.logf("Downloaded %s from message #%d to %s", name, payload.MessageID, path)
 }
 
 func (a *App) isConnected() bool {
@@ -961,11 +1058,12 @@ func (a *App) formatChatMessage(msg protocol.ChatMessage) string {
 	if msg.CreatedAt > 0 {
 		timestamp = time.Unix(msg.CreatedAt, 0).Local().Format("15:04:05")
 	}
+	idPrefix := fmt.Sprintf("[#%d]", msg.ID)
 	body := a.renderMessageBody(msg)
 	if timestamp != "" {
-		return fmt.Sprintf("[%s] %s: %s", timestamp, username, body)
+		return fmt.Sprintf("%s [%s] %s: %s", idPrefix, timestamp, username, body)
 	}
-	return fmt.Sprintf("%s: %s", username, body)
+	return fmt.Sprintf("%s %s: %s", idPrefix, username, body)
 }
 
 func (a *App) renderMessageBody(msg protocol.ChatMessage) string {
@@ -989,6 +1087,41 @@ func (a *App) renderMessageBody(msg protocol.ChatMessage) string {
 		}
 		return content
 	}
+}
+
+func (a *App) writeDownloadedFile(name, sha string, data []byte) (string, error) {
+	base := strings.TrimSpace(name)
+	if base == "" {
+		base = strings.TrimSpace(sha)
+	}
+	if base == "" {
+		base = fmt.Sprintf("download_%d", time.Now().Unix())
+	}
+	base = filepath.Base(base)
+	if base == "" || base == "." || base == string(filepath.Separator) {
+		base = fmt.Sprintf("download_%d", time.Now().Unix())
+	}
+
+	candidate := base
+	for i := 0; i < 100; i++ {
+		path := filepath.Join(".", candidate)
+		_, err := os.Stat(path)
+		if err == nil {
+			ext := filepath.Ext(base)
+			stem := strings.TrimSuffix(base, ext)
+			candidate = fmt.Sprintf("%s(%d)%s", stem, i+1, ext)
+			continue
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return "", err
+		}
+		if err := os.WriteFile(path, data, 0o600); err != nil {
+			return "", err
+		}
+		return path, nil
+	}
+
+	return "", fmt.Errorf("unable to create file for %s", base)
 }
 
 func (a *App) updateViewportContent() {
@@ -1119,7 +1252,7 @@ func defaultCommands() []commandSpec {
 		{trigger: "/join", usage: "/join <room>", description: "Join a room"},
 		{trigger: "/leave", usage: "/leave", description: "Leave current room"},
 		{trigger: "/upload", usage: "/upload <path>", description: "Upload a file"},
-		{trigger: "/download", usage: "/download <file>", description: "Download a file"},
+		{trigger: "/download", usage: "/download <message_id>", description: "Download a file shared in chat"},
 		{trigger: "/quit", usage: "/quit", description: "Exit the client"},
 	}
 }
@@ -1157,7 +1290,7 @@ func countLines(s string) int {
 	return strings.Count(s, "\n") + 1
 }
 
-const homeContent = "SlashChat\n\nUse /connect to reach the server.\nUse /register or /login after connecting.\nUse /join <room> to load chat history.\nUse /help to browse all commands."
+const homeContent = "SlashChat\n\nUse /connect to reach the server.\nUse /register or /login after connecting.\nUse /join <room> to load chat history.\nUse /download <message_id> to retrieve shared files.\nUse /help to browse all commands."
 
 func (a *App) renderHelpView() string {
 	var b strings.Builder
@@ -1252,6 +1385,21 @@ func decodeChatMessage(payload interface{}) (protocol.ChatMessage, error) {
 		return msg, err
 	}
 	return msg, nil
+}
+
+func decodeFileDownloadPayload(payload interface{}) (protocol.FileDownloadPayload, error) {
+	var dl protocol.FileDownloadPayload
+	if payload == nil {
+		return dl, fmt.Errorf("download payload empty")
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return dl, err
+	}
+	if err := json.Unmarshal(data, &dl); err != nil {
+		return dl, err
+	}
+	return dl, nil
 }
 
 func metadataString(metadata map[string]interface{}, key string) string {

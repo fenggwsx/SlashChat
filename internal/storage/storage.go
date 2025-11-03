@@ -27,6 +27,7 @@ type Store interface {
 	GetUserByUsername(ctx context.Context, username string) (*User, error)
 	SaveMessage(ctx context.Context, msg *Message) error
 	ListMessagesByRoom(ctx context.Context, room string, limit int) ([]Message, error)
+	GetMessageByID(ctx context.Context, id uint) (*Message, error)
 }
 
 // Message represents a persisted chat message entry.

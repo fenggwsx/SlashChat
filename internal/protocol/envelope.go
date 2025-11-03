@@ -13,6 +13,7 @@ const (
 	MessageTypeAck          MessageType = "ack"
 	MessageTypeFileChunk    MessageType = "file_chunk"
 	MessageTypeFileUpload   MessageType = "file_upload"
+	MessageTypeFileDownload MessageType = "file_download"
 )
 
 // MessageKind distinguishes persisted chat payload semantics.
@@ -60,6 +61,19 @@ type FileUploadRequest struct {
 // FileUploadPayload transports a complete file payload.
 type FileUploadPayload struct {
 	Room       string `json:"room"`
+	Filename   string `json:"filename"`
+	SHA256     string `json:"sha256"`
+	DataBase64 string `json:"data_base64"`
+}
+
+// FileDownloadRequest asks the server to send the file for a stored message.
+type FileDownloadRequest struct {
+	MessageID uint `json:"message_id"`
+}
+
+// FileDownloadPayload delivers file contents for a specific message.
+type FileDownloadPayload struct {
+	MessageID  uint   `json:"message_id"`
 	Filename   string `json:"filename"`
 	SHA256     string `json:"sha256"`
 	DataBase64 string `json:"data_base64"`
