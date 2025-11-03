@@ -4,8 +4,9 @@ SlashChat is a socket-driven chat system built in Go. A Bubbletea-powered termin
 
 ## Highlights
 - Go TCP server with JWT-authenticated sessions, room membership, persistent SQLite storage, and structured logging.
-- Bubbletea TUI client with command/insert modes, ANSI-styled transcript view, chat IDs, and an ASCII splash screen when idle.
-- File uploads store binaries under `uploads/` by SHA-256; `/download <message_id>` retrieves shared files on demand.
+- Bubbletea TUI client with command/insert modes, ANSI-styled transcript view, chat IDs, auto-wrapping messages, tab-completed commands, and an ASCII splash screen when idle.
+- File uploads store binaries under `uploads/` by SHA-256; `/download <message_id>` retrieves shared files on demand with contextual hints when authentication or room membership is missing.
+- `/pipe` transport inspector renders the live JSON protocol feed with pretty-printed frames and quick history clearing.
 - GitHub Actions pipeline builds CGO-free binaries for Linux, macOS, and Windows whenever a tag (or manual tag input) is provided.
 
 ## Requirements
@@ -54,8 +55,11 @@ Both binaries read environment variables for customization:
 - `/join <room>` / `/leave` – Enter or exit a chat room; joining loads recent history.
 - `/upload <path>` – Share a file. The client sends the SHA-256 first for instant reuse; otherwise the file is encoded and uploaded.
 - `/download <message_id>` – Download a file that was posted in chat; files save to the current working directory.
+- `/pipe` – Switch to the transport inspector; view raw JSON frames and use built-in commands to clear the feed.
 - `/chat` / `/help` / `/quit` – Switch view, show built-in help, or exit the program.
 - Typing text while connected and in insert mode sends a room message.
+- Command input supports tab completion for the longest common prefix of matching commands. When trying to chat from outside the `/chat` view, the client will automatically switch back after sending (excluding `/pipe`).
+- Status messages under the input box distinguish regular updates from errors using ANSI colors.
 
 Message history shows timestamps, senders, and message IDs (useful for `/download`). File entries display the original filename alongside the SHA-derived storage key.
 
