@@ -1,70 +1,57 @@
-GoSlash Project Brief
+SlashChat Agent Brief
 
-Purpose
-- Build a socket-driven terminal chat system that highlights custom protocol design, concurrent processing, authentication, persistence, and command-centric interaction.
-- Deliver a concise but complete showcase for real-time messaging and file exchange from a command-first TUI client.
+Overview
+- SlashChat ships a TCP chat stack with a Go server, Bubbletea TUI client, authentication, room-based messaging, and basic file sharing.
+- The codebase follows the Go module layout (`cmd/server`, `cmd/client`, `internal/...`) and targets CGO-free builds for Linux, macOS, and Windows.
+- Real-time communication uses a custom JSON protocol over raw TCP with length-prefixed frames; both client and server keep asynchronous loops to remain responsive.
 
-Core Components
-- Server: Listens on TCP sockets, multiplexes authenticated sessions, enforces room membership, and coordinates message plus file routing.
-- Client: Bubbletea-powered terminal UI with modal editing inspired by Vim; command palette accepts slash-prefixed actions.
-- Shared Protocol: Pure JSON envelopes with explicit framing and identifier fields to prevent delimiter-based parsing issues.
+Core Architecture
+- Server (`internal/server`): Manages TCP sessions, JWT-authenticated users, room membership, message persistence, and file uploads/downloads. Each client has dedicated read/write goroutines coordinated through a hub.
+- Client (`internal/client`): Bubbletea single-view interface with command and insert modes, chat history viewport, and ANSI color styling. Displays an ASCII “SLASH CHAT” banner (go-figure) until the user joins a room.
+- Protocol (`internal/protocol`): Defines envelopes, command payloads, message kinds, and length-prefixed framing helpers.
 
-Protocol Overview
-- Transport: Raw TCP with length-prefixed JSON frames (e.g., 4-byte big-endian unsigned integer indicating upcoming JSON byte length).
-- Envelope Fields: Unique message id, message type, timestamp, auth token (when applicable), payload object, optional metadata for file chunks.
-- File Transfer: Payload includes filename, MIME hint, chunk index, total chunks, and Base64-encoded data length that respects max frame size.
-- Reliability: Each client acknowledges actionable events; server may retransmit or mark delivery status when acknowledgements are missing.
+Authentication & Identity
+- Registration and login are handled through `/register` and `/login`; passwords are hashed with `bcrypt`.
+- On success the server issues JWTs (golang-jwt) whose subject is the user ID; the client reuses the token in subsequent requests.
+- Sessions log authentication attempts and include basic rate-limiting hooks (extend if brute-force mitigation is needed).
 
-Authentication and Identity
-- Registration: Client submits username and password; server salts and hashes using bcrypt before persisting via GORM into SQLite.
-- Login Flow: Successful credentials return a JWT signed with a server-side secret; subsequent client requests include the token in the protocol header.
-- Authorization: JWT subject pins to account id; server validates token before processing room joins, message sends, or file transfers.
+Persistence
+- SQLite (modernc.org/sqlite via GORM) stores `users` and `messages`. Messages carry `kind` (`text` or `file`), `content` (text body or original filename), and optional `file_sha`.
+- File binaries live in `uploads/` and are named after their SHA-256 digest. GORM is configured to suppress “record not found” errors in logs.
+- Migrations run at startup; all timestamps use UTC.
 
-Persistence Model
-- SQLite database accessed through GORM with connection pooling tuned for concurrent goroutines.
-- Tables for users, rooms, room memberships, and message/file logs; migrations managed at startup.
-- Audit-friendly timestamps stored in UTC, with soft-delete fields when practical.
+Messaging & File Flow
+- Every frame is a JSON envelope with `id`, `type`, `timestamp`, optional `token`, and `payload`.
+- Text messages persist the raw content. File messages require the client to send the SHA first: existing files are acknowledged immediately, otherwise the full payload is base64-encoded and written to disk before persistence.
+- `/download <message_id>` requests the stored file via message ID; chat history includes IDs (especially for file entries) so users can target downloads.
 
 Client Experience
-- Dual-pane layout: left pane for room roster or context list, right pane for streaming messages, bottom command line for slash commands.
-- Modes: command mode (navigation, completion, history) and insert mode (free text composition). Immediate hints for available commands as the user types.
-- Slash Commands: `/join <room>`, `/leave`, `/upload <path>`, `/download <file>`, `/users`, `/help`, plus extensible hook for future actions.
-- Autocompletion: Context-sensitive suggestions for room names, files, and command arguments.
+- Chat and home views were merged: the default screen shows the ASCII banner and quick tips; joining a room swaps in the scrolling transcript.
+- Commands support history/completion hints. Message list shows sender, room, timestamp, and message ID when relevant.
+- Status bar reflects connection state, current room, and last log message; connect/disconnect events log to the TUI footer.
 
-Concurrency Strategy
-- Server goroutines manage per-client read/write loops, authentication handlers, and room broadcasters; coordinate access with channels or synchronized maps.
-- Client uses asynchronous subscriptions to handle inbound updates without blocking user input; Bubbletea tea.Cmd pattern keeps UI responsive.
-- Background workers handle file chunk assembly and integrity verification.
+Command Reference
+- `/connect [addr]` — open a TCP session (defaults to configured server).
+- `/register <username> <password>` — create an account.
+- `/login <username> <password>` — authenticate and cache the JWT.
+- `/join <room>` / `/leave` — enter or exit a chat room.
+- `/upload <path>` — send a file (performs SHA quick check).
+- `/download <message_id>` — fetch a previously shared file.
+- `/users` — list room members (via server event).
+- `/chat` / `/help` / `/quit` — switch view, show help, or exit.
+- Regular text (without slash) posts a message to the active room.
 
-Dependencies
-- Pure Go SQLite driver (modernc.org/sqlite recommended for CGO-free builds).
-- GORM for ORM abstractions and migration management.
-- Bubbletea (github.com/charmbracelet/bubbletea) plus supporting lipgloss/bubbles libraries for TUI styling and interaction.
-- bcrypt via golang.org/x/crypto/bcrypt for password hashing.
-- JWT library (github.com/golang-jwt/jwt/v5 or equivalent) for token generation and validation.
+Logging & Observability
+- Server prints startup address, authentication results, joins/leaves, message broadcasts, and file transfers with remote addresses.
+- Client logs connect/disconnect lifecycle and notable errors.
+- Consider shipping logs to a centralized sink or adding structured JSON if deploying beyond local setups.
 
-Development Guidelines
-- Stick to standard Go project layout (`cmd/server`, `cmd/client`, `internal/...`) and keep shared protocol structures in dedicated packages.
-- Implement context-aware logging with structured fields; ensure sensitive data (password hashes, JWT secrets) never logged.
-- Wrap socket operations with deadlines or cancellation contexts to prevent goroutine leaks.
-- Validate and sanitize all client-supplied data before storage or broadcast; enforce payload size limits.
-- Keep platform dependencies minimal to maintain cross-platform builds; use Go modules for dependency control.
+Build & Release
+- `make` targets wrap gofmt/goimports, vet, and build tasks (extend as needed).
+- GitHub Actions workflow (`.github/workflows/build-release.yml`) builds CGO-disabled binaries for linux/amd64, macos/amd64, and windows/amd64. It triggers on tags and supports manual dispatch with an explicit tag input, publishing artifacts via `softprops/action-gh-release`.
+- Recommended local checks: `go fmt ./...` on both server and client.
 
-Commit Conventions
-- Use conventional prefixes (`feat`, `fix`, `docs`, `chore`, `test`, etc.) followed by a concise description in lowercase.
-- Prefer imperative mood; omit trailing punctuation; amend commits when necessary to comply before merging.
-
-Testing and Tooling
-- Unit-test protocol marshalling, authentication flows, and database interactions with in-memory SQLite.
-- Integration tests spawn ephemeral server and scripted client sessions to verify join, messaging, and file transfer.
-- Use linting (golangci-lint) and gofmt/goimports; automate with simple make targets.
-
-Security and Secrets
-- Store JWT signing keys and database paths via environment variables or config files outside version control.
-- Enforce strong password requirements and rate-limit login attempts to reduce brute-force attacks.
-- Consider TLS termination or SSH tunnelling for transport security during deployment.
-
-Future Extensions
-- Message search, offline delivery queues, and richer room administration commands.
-- Plugin interface for custom slash commands and bot integrations.
-- Optional WebSocket bridge or REST API for non-terminal clients.
+Future Opportunities
+- Improve transport security (TLS or SSH tunnel), add backoff/retry on reconnect, and enforce stricter password/command rate limits.
+- Expand `/users` to show presence metadata, add pagination/search for history, and surface upload progress for large files.
+- Integration tests currently limited; consider automated client/server smoke tests around upload/download and auth flows.
