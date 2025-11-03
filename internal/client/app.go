@@ -790,6 +790,10 @@ func (a *App) sendChatMessage(content string) tea.Cmd {
 		a.logErrorf("Not connected. Use /connect first.")
 		return nil
 	}
+	if strings.TrimSpace(a.authToken) == "" {
+		a.logErrorf("Authenticate before chatting (use /login or /register)")
+		return nil
+	}
 	room := strings.TrimSpace(a.room)
 	if room == "" || room == "-" {
 		a.logErrorf("Join a room before chatting (use /join <room>)")
