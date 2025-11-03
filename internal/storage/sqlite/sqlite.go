@@ -3,10 +3,13 @@ package sqlite
 import (
 	"context"
 	"errors"
+	"log"
+	"os"
 	"time"
 
 	"github.com/glebarez/sqlite"
 	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
 
 	"github.com/fenggwsx/SlashChat/internal/config"
 	"github.com/fenggwsx/SlashChat/internal/storage"
@@ -38,7 +41,17 @@ type Message struct {
 
 // NewStore opens a SQLite database at the provided path.
 func NewStore(cfg config.DatabaseConfig) (*Store, error) {
-	db, err := gorm.Open(sqlite.Open(cfg.Path), &gorm.Config{})
+	gormLogger := logger.New(
+		log.New(os.Stdout, "", log.LstdFlags),
+		logger.Config{
+			SlowThreshold:             time.Second,
+			LogLevel:                  logger.Warn,
+			IgnoreRecordNotFoundError: true,
+		},
+	)
+	db, err := gorm.Open(sqlite.Open(cfg.Path), &gorm.Config{
+		Logger: gormLogger,
+	})
 	if err != nil {
 		return nil, err
 	}
