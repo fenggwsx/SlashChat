@@ -98,6 +98,16 @@ func (s *clientSession) unregisterAll() {
 	}
 }
 
+func (s *clientSession) remoteAddr() string {
+	if s.conn == nil {
+		return ""
+	}
+	if addr := s.conn.RemoteAddr(); addr != nil {
+		return addr.String()
+	}
+	return ""
+}
+
 func (s *clientSession) close() {
 	s.closeMux.Do(func() {
 		s.unregisterAll()

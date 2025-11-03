@@ -65,6 +65,7 @@ func (a *App) Run(ctx context.Context) error {
 		return fmt.Errorf("listen: %w", err)
 	}
 	a.listener = listener
+	log.Printf("server listening on %s", listener.Addr().String())
 
 	errCh := make(chan error, 1)
 
@@ -102,6 +103,8 @@ func (a *App) handleConnection(parentCtx context.Context, conn net.Conn) {
 	decoder := protocol.NewDecoder(conn)
 	encoder := protocol.NewEncoder(conn)
 	session := newClientSession(a, conn)
+	log.Printf("client connected remote=%s session=%s", session.remoteAddr(), session.id)
+	defer log.Printf("client disconnected remote=%s session=%s", session.remoteAddr(), session.id)
 
 	go func() {
 		if err := session.writeLoop(ctx, encoder, a.cfg.WriteTimeout); err != nil && !errors.Is(err, context.Canceled) {
@@ -314,6 +317,7 @@ func (a *App) handleChatSend(ctx context.Context, session *clientSession, env pr
 	}
 
 	a.sendAck(ctx, session, env.ID, ackStatusOK, "")
+	log.Printf("chat message stored id=%d room=%s user=%s len=%d remote=%s", msg.ID, msg.Room, claims.Username, len(content), session.remoteAddr())
 
 	a.broadcastChatMessage(msg)
 	return nil
@@ -480,6 +484,7 @@ func (a *App) handleFileUploadPrepare(ctx context.Context, session *clientSessio
 	}
 
 	a.sendAck(ctx, session, env.ID, ackStatusOK, "")
+	log.Printf("file message stored id=%d room=%s user=%s filename=%s remote=%s upload=skipped", msg.ID, msg.Room, claims.Username, filename, session.remoteAddr())
 	a.broadcastChatMessage(msg)
 	return nil
 }
@@ -543,12 +548,14 @@ func (a *App) handleFileUploadData(ctx context.Context, session *clientSession, 
 	}
 
 	a.sendAck(ctx, session, env.ID, ackStatusOK, "")
+	log.Printf("file message stored id=%d room=%s user=%s filename=%s size=%dB remote=%s upload=completed", msg.ID, msg.Room, claims.Username, filename, len(data), session.remoteAddr())
 	a.broadcastChatMessage(msg)
 	return nil
 }
 
 func (a *App) handleFileDownloadCommand(ctx context.Context, session *clientSession, env protocol.Envelope) error {
-	if _, err := a.claimsFromEnvelope(env); err != nil {
+	claims, err := a.claimsFromEnvelope(env)
+	if err != nil {
 		a.sendAck(ctx, session, env.ID, ackStatusError, "unauthorized")
 		return nil
 	}
@@ -630,24 +637,34 @@ func (a *App) handleFileDownloadCommand(ctx context.Context, session *clientSess
 		},
 	}
 
-	return session.send(ctx, response)
+	if err := session.send(ctx, response); err != nil {
+		return err
+	}
+	log.Printf("file download served message_id=%d room=%s requester=%s remote=%s size=%dB", msg.ID, msg.Room, claims.Username, session.remoteAddr(), len(data))
+	return nil
 }
 
 func (a *App) handleRegister(ctx context.Context, session *clientSession, referenceID string, req protocol.AuthRequest) error {
+	username := strings.TrimSpace(req.Username)
 	user, err := a.createUser(ctx, req)
 	if err != nil {
+		log.Printf("register failed user=%s remote=%s err=%v", username, session.remoteAddr(), err)
 		a.reportAuthError(ctx, session, referenceID, err)
 		return nil
 	}
+	log.Printf("register success user=%s id=%d remote=%s", user.Username, user.ID, session.remoteAddr())
 	return a.issueToken(ctx, session, referenceID, user)
 }
 
 func (a *App) handleLogin(ctx context.Context, session *clientSession, referenceID string, req protocol.AuthRequest) error {
+	username := strings.TrimSpace(req.Username)
 	user, err := a.authenticateUser(ctx, req)
 	if err != nil {
+		log.Printf("login failed user=%s remote=%s err=%v", username, session.remoteAddr(), err)
 		a.reportAuthError(ctx, session, referenceID, err)
 		return nil
 	}
+	log.Printf("login success user=%s id=%d remote=%s", user.Username, user.ID, session.remoteAddr())
 	return a.issueToken(ctx, session, referenceID, user)
 }
 
