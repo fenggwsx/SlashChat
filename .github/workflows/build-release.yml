@@ -1,0 +1,91 @@
+name: build-release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build and release (optional when ref is a tag)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - name: linux-amd64
+            goos: linux
+            goarch: amd64
+            runner: ubuntu-latest
+            ext: ""
+          - name: macos-amd64
+            goos: darwin
+            goarch: amd64
+            runner: macos-latest
+            ext: ""
+          - name: windows-amd64
+            goos: windows
+            goarch: amd64
+            runner: windows-latest
+            ext: ".exe"
+    runs-on: ${{ matrix.runner }}
+    env:
+      CGO_ENABLED: 0
+      GOOS: ${{ matrix.goos }}
+      GOARCH: ${{ matrix.goarch }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          go env
+          go build -trimpath -ldflags "-s -w" -o "dist/slashchat-server_${{ matrix.name }}${{ matrix.ext }}" ./cmd/server
+          go build -trimpath -ldflags "-s -w" -o "dist/slashchat-client_${{ matrix.name }}${{ matrix.ext }}" ./cmd/client
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: slashchat-${{ matrix.name }}
+          path: dist/
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && github.event.inputs.tag != '')
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Determine tag name
+        id: releasetag
+        run: |
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" && "${{ github.event.inputs.tag }}" != "" ]]; then
+            echo "name=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.releasetag.outputs.name }}
+          name: ${{ steps.releasetag.outputs.name }}
+          files: artifacts/**/slashchat-*
