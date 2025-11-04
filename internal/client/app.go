@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/charmbracelet/bubbles/help"
+	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
@@ -157,6 +158,7 @@ func NewApp(cfg config.ClientConfig) *App {
 
 	vp := viewport.New(0, 0)
 	vp.MouseWheelEnabled = true
+	vp.KeyMap = restrictedViewportKeyMap()
 	helper := help.New()
 	helper.ShowAll = true
 
@@ -342,5 +344,34 @@ func (v activeView) String() string {
 		return "pipe"
 	default:
 		return "unknown"
+	}
+}
+
+func restrictedViewportKeyMap() viewport.KeyMap {
+	return viewport.KeyMap{
+		PageDown: key.NewBinding(
+			key.WithKeys("pgdown"),
+			key.WithHelp("pgdn", "page down"),
+		),
+		PageUp: key.NewBinding(
+			key.WithKeys("pgup"),
+			key.WithHelp("pgup", "page up"),
+		),
+		Down: key.NewBinding(
+			key.WithKeys("down"),
+			key.WithHelp("↓", "down"),
+		),
+		Up: key.NewBinding(
+			key.WithKeys("up"),
+			key.WithHelp("↑", "up"),
+		),
+		Left: key.NewBinding(
+			key.WithKeys("left"),
+			key.WithHelp("←", "move left"),
+		),
+		Right: key.NewBinding(
+			key.WithKeys("right"),
+			key.WithHelp("→", "move right"),
+		),
 	}
 }
